@@ -40,11 +40,12 @@ class Book(Base):
     cover = sql.Column(sql.String(32))
     cover_type = sql.Column(sql.String(32))
     doublicat = sql.Column(sql.Integer, nullable=False, default=0)
+    search_title = sql.Column(sql.String(256), index=True)
 
     authors = orm.relationship('Author', secondary=book_authors, backref='books')
     genres = orm.relationship('Genre', secondary=book_genre, backref='books')
 
-    def __init__(self, name, path, cat_id, size, format_book, title, lang, archive, doublicat):
+    def __init__(self, name='fn', path='/', cat_id=0, format_book='fb2', title='title', lang='ru', size=0, archive=0, doublicat=0):
         self.filename = name
         self.path = path
         self.cat_id = cat_id
@@ -54,6 +55,7 @@ class Book(Base):
         self.lang = lang
         self.cat_type = archive
         self.doublicat = doublicat
+        self.search_title = self.title.lower()
 
     def __repr__(self):
         return "<Book('%s','%s')>" % (self.title, ','.join(self.authors))
@@ -70,7 +72,7 @@ class Catalog(Base):
 
     books = orm.relationship('Book', backref='catalog')
 
-    def __init__(self, parent_id, cat_name, path, cat_type):
+    def __init__(self, parent_id=0, cat_name='dir', path='/', cat_type=0):
         self.parent_id = parent_id
         self.cat_name = cat_name
         self.path = path
@@ -88,7 +90,7 @@ class Author(Base):
     last_name = sql.Column(sql.String(64))
     search_name = sql.Column(sql.String(128), index=True)
 
-    def __init__(self, last_name, first_name=''):
+    def __init__(self, last_name='name', first_name=''):
         self.last_name = last_name
         self.first_name = first_name
         self.search_name = last_name.lower()+' '+first_name.lower()
@@ -191,15 +193,14 @@ class opdsDatabase:
             doublicat = self.finddouble(title, format_book, size)
         else:
             doublicat = 0
-        book = Book(name, path, cat_id, size, format_book, title, lang, archive, doublicat)
+        book = Book(name, path, cat_id, format_book, title, lang, size, archive, doublicat)
         self.session.add(book)
         self.session.commit()
         return book.book_id
 
     def addcover(self, book_id, fn, cover_type):
-        try:
-            book = self.session.query(Book).filter(Book.book_id == book_id).one()
-        except:
+        book = self.session.query(Book).get(book_id)
+        if not book:
             return
         book.cover = fn
         book.cover_type = cover_type
@@ -215,10 +216,9 @@ class opdsDatabase:
         return author_id
 
     def findbauthor(self, book_id, author_id):
-        try:
-            book = self.session.query(Book).filter(Book.book_id == book_id).one()
-            author = self.session.query(Author).filter(Author.author_id == author_id).one()
-        except orm.exc.NoResultFound:
+        book = self.session.query(Book).get(book_id)
+        author = self.session.query(Author).get(author_id)
+        if not book or not author:
             return False
         result = author in book.authors
         return result
@@ -233,10 +233,9 @@ class opdsDatabase:
         return author.author_id
 
     def addbauthor(self, book_id, author_id):
-        try:
-            book = self.session.query(Book).filter(Book.book_id == book_id).one()
-            author = self.session.query(Author).filter(Author.author_id == author_id).one()
-        except orm.exc.NoResultFound:
+        book = self.session.query(Book).get(book_id)
+        author = self.session.query(Author).get(author_id)
+        if not book or not author:
             return
         book.authors.append(author)
         self.session.commit()
@@ -250,10 +249,9 @@ class opdsDatabase:
         return genre_id
 
     def findbgenre(self, book_id, genre_id):
-        try:
-            book = self.session.query(Book).filter(Book.book_id == book_id).one()
-            genre = self.session.query(Genre).filter(Genre.genre_id == genre_id).one()
-        except orm.exc.NoResultFound:
+        book = self.session.query(Book).get(book_id)
+        genre = self.session.query(Genre).get(genre_id)
+        if not book or not genre:
             return False
         result = genre in book.genres
         return result
@@ -268,8 +266,10 @@ class opdsDatabase:
         return _genre.genre_id
 
     def addbgenre(self, book_id, genre_id):
-        book = self.session.query(Book).filter(Book.book_id == book_id).one()
-        genre = self.session.query(Genre).filter(Genre.genre_id == genre_id).one()
+        book = self.session.query(Book).get(book_id)
+        genre = self.session.query(Genre).get(genre_id)
+        if not book or not genre:
+            return
         book.genres.append(genre)
         self.session.commit()
 
@@ -308,7 +308,7 @@ class opdsDatabase:
             rows = query.all()
         else:
             offset = limit * page
-            rows = query[offset:limit]
+            rows = query[offset:(offset+limit)]
         return rows
 
     def getbooksincat(self, cat_id, limit=0, page=0):
@@ -319,65 +319,61 @@ class opdsDatabase:
             rows = query.all()
         else:
             offset = limit * page
-            rows = query[offset:limit]
+            rows = query[offset:(offset+limit)]
         return rows
 
     def getitemsincat(self, cat_id, limit=0, page=0):
-        query1 = self.session.query(1, Catalog.cat_id, Catalog.cat_name, Catalog.path, sql.func.now(),
+        query1 = self.session.query(sql.sql.expression.literal_column('1').label('cat'), Catalog.cat_id, Catalog.cat_name, Catalog.path, sql.func.now(),
                                     Catalog.cat_name.label('title')).filter(Catalog.parent_id == cat_id)
-        query2 = self.session.query(2, Book.book_id, Book.filename, Book.path, Book.registerdate,
+        query2 = self.session.query(sql.sql.expression.literal_column('2'), Book.book_id, Book.filename, Book.path, Book.registerdate,
                                     Book.title).filter(Book.cat_id == cat_id)
         if limit == 0:
-            rows = query1.union(query2).order_by(1, 6).all()
+            rows = query1.union(query2).order_by('1', '6').all()
             self.next_page = False
         else:
             found_rows = query1.union(query2).count()
             offset = limit * page
-            rows = query1.union(query2).order_by(1, 6)[offset:limit]
-            self.next_page = (found_rows > (offset + limit))
+            rows = query1.union(query2).order_by('1', '6')[offset:(offset+limit)]
+            self.next_page = (found_rows > (offset+limit))
         return rows
 
     def getbook(self, book_id):
-        row = self.session.query(Book.filename, Book.path, Book.registerdate, Book.format, Book.title, Book.cat_type,
-                                 Book.cover, Book.cover_type, Book.filesize). \
-                                 filter(Book.book_id == book_id).one()
-        return row
+        book = self.session.query(Book).get(book_id)
+        if not book:
+            return tuple()
+        return (book.filename, book.path, book.registerdate, book.format, book.title, book.cat_type,
+                book.cover, book.cover_type, book.filesize)
 
     def getauthors(self, book_id):
-        book = self.session.query(Book).filter(Book.book_id == book_id).one()
+        book = self.session.query(Book).get(book_id)
+        if not book:
+            return tuple()
         rows = [(author.first_name, author.last_name) for author in book.authors]
         return rows
 
     def getgenres(self, book_id):
-        book = self.session.query(Book).filter(Book.book_id == book_id).one()
+        book = self.session.query(Book).get(book_id)
+        if not book:
+            return tuple()
         rows = [(genre.section, genre.subsection) for genre in book.genres]
         return rows
 
-    # def getauthor_2letters(self, letters):
-    #     lc = len(letters) + 1
-    #     sql = "select UPPER(substring(trim(CONCAT(last_name,' ',first_name)),1," + str(
-    #         lc) + ")) as letters, count(*) as cnt from " + TBL_AUTHORS + " where UPPER(substring(trim(CONCAT(last_name,' ',first_name)),1," + str(
-    #         lc - 1) + "))='" + letters + "' group by 1 order by 1"
-    #     cursor = self.cnx.cursor()
-    #     cursor.execute(sql)
-    #     rows = cursor.fetchall()
-    #     cursor.close
-    #     return rows
-    #
-    # def gettitle_2letters(self, letters, doublicates=True):
-    #     if doublicates:
-    #         dstr = ''
-    #     else:
-    #         dstr = ' and doublicat=0 '
-    #     lc = len(letters) + 1
-    #     sql = "select UPPER(substring(trim(title),1," + str(
-    #         lc) + ")) as letteris, count(*) as cnt from " + TBL_BOOKS + " where UPPER(substring(trim(title),1," + str(
-    #         lc - 1) + "))='" + letters + "' " + dstr + " group by 1 order by 1"
-    #     cursor = self.cnx.cursor()
-    #     cursor.execute(sql)
-    #     rows = cursor.fetchall()
-    #     cursor.close
-    #     return rows
+    def getauthor_2letters(self, letters):
+        lc = len(letters) + 1
+        query = self.session.query(sql.func.substr(Author.search_name, 1, lc).label('letters'),
+                                   sql.func.count('*').label('cnt')).\
+            filter(Author.search_name.like(letters.lower()+'%')).group_by('1').order_by('1')
+        return query.all()
+
+    def gettitle_2letters(self, letters, doublicates=True):
+        lc = len(letters) + 1
+        query = self.session.query(sql.func.substr(Book.title, 1, lc).label('letters'),
+                                   sql.func.count('*').label('cnt')).\
+            filter(Book.search_title.like(letters.lower()+'%'))
+        if not doublicates:
+            query = query.filter(Book.doublicat == 0)
+        query = query.group_by('1').order_by('1')
+        return query.all()
 
     def getbooksfortitle(self, letters, limit=0, page=0, doublicates=True):
         query = self.session.query(Book.book_id, Book.filename, Book.path, Book.registerdate, Book.title, Book.cover,
@@ -390,60 +386,43 @@ class opdsDatabase:
         else:
             found_rows = query.count()
             offset = limit * page
-            rows = query[offset:limit]
-            self.next_page = (found_rows > (offset + limit))
+            rows = query[offset:(offset+limit)]
+            self.next_page = (found_rows > (offset+limit))
         return rows
 
-    # def getauthorsbyl(self, letters, limit=0, page=0, doublicates=True):
-    #     if limit == 0:
-    #         limitstr = ""
-    #     else:
-    #         limitstr = "limit " + str(limit * page) + "," + str(limit)
-    #     if doublicates:
-    #         dstr = ''
-    #     else:
-    #         dstr = ' and c.doublicat=0 '
-    #     sql = "select SQL_CALC_FOUND_ROWS a.author_id, a.first_name, a.last_name, count(*) as cnt from " + TBL_AUTHORS + " a, " + TBL_BAUTHORS + " b, " + TBL_BOOKS + " c where a.author_id=b.author_id and b.book_id=c.book_id and UPPER(a.last_name) like '" + letters + "%' " + dstr + " group by 1,2,3 order by 3,2 " + limitstr
-    #     cursor = self.cnx.cursor()
-    #     cursor.execute(sql)
-    #     rows = cursor.fetchall()
-    #
-    #     cursor.execute("SELECT FOUND_ROWS()")
-    #     found_rows = cursor.fetchone()
-    #     if found_rows[0] > limit * page + limit:
-    #         self.next_page = True
-    #     else:
-    #         self.next_page = False
-    #
-    #     cursor.close
-    #     return rows
-    #
-    # def getbooksforautor(self, author_id, limit=0, page=0, doublicates=True):
-    #     author = self.session.query(Author).filter(Author.author_id == author_id).one()
-    #
-    #     if limit == 0:
-    #         limitstr = ""
-    #     else:
-    #         limitstr = "limit " + str(limit * page) + "," + str(limit)
-    #     if doublicates:
-    #         dstr = ''
-    #     else:
-    #         dstr = ' and a.doublicat=0 '
-    #     sql = "select SQL_CALC_FOUND_ROWS a.book_id,a.filename,a.path,a.registerdate,a.title,a.cover,a.cover_type from " + TBL_BOOKS + " a, " + TBL_BAUTHORS + " b where a.book_id=b.book_id and b.author_id=" + str(
-    #         author_id) + dstr + " order by a.title " + limitstr
-    #     cursor = self.cnx.cursor()
-    #     cursor.execute(sql)
-    #     rows = cursor.fetchall()
-    #
-    #     cursor.execute("SELECT FOUND_ROWS()")
-    #     found_rows = cursor.fetchone()
-    #     if found_rows[0] > limit * page + limit:
-    #         self.next_page = True
-    #     else:
-    #         self.next_page = False
-    #
-    #     cursor.close
-    #     return rows
+    def getauthorsbyl(self, letters, limit=0, page=0, doublicates=True):
+        query = self.session.query(Author.author_id, Author.first_name, Author.last_name,
+                                   sql.func.count(book_authors)).filter(Author.author_id == book_authors.c.author_id,
+                                                                        Author.search_name.like(letters.lower()+'%'))
+        if not doublicates:
+            query = query.filter(book_authors.c.book_id == Book.book_id, Book.doublicat == 0)
+        query = query.group_by('1', '2', '3')
+        query = query.order_by(Author.search_name)
+        if limit == 0:
+            rows = query.all()
+        else:
+            found_rows = query.count()
+            offset = limit * page
+            rows = query[offset:(offset+limit)]
+            self.next_page = (found_rows > (offset+limit))
+        return rows
+
+    def getbooksforautor(self, author_id, limit=0, page=0, doublicates=True):
+        query = self.session.query(Book.book_id, Book.filename, Book.path, Book.registerdate, Book.title, Book.cover,
+                                   Book.cover_type).filter(Book.book_id == book_authors.c.book_id,
+                                                           book_authors.c.author_id == author_id)
+        if not doublicates:
+            query = query.filter(Book.doublicat == 0)
+        query = query.order_by(Book.title)
+        if limit == 0:
+            rows = query.all()
+            self.next_page = False
+        else:
+            found_rows = query.count()
+            offset = limit * page
+            rows = query[offset:(offset+limit)]
+            self.next_page = (found_rows > (offset+limit))
+        return rows
 
     def getlastbooks(self, limit=0):
         query = self.session.query(Book.book_id, Book.filename, Book.path, Book.registerdate, Book.title). \
@@ -454,50 +433,39 @@ class opdsDatabase:
             rows = query[:limit]
         return rows
 
-    # def getgenres_sections(self):
-    #     rows = self.session.query()
-    #     sql = "select min(a.genre_id), a.section, count(*) as cnt from " + TBL_GENRES + " a, " +\
-    #           TBL_BGENRES + " b where a.genre_id=b.genre_id group by a.section order by a.section"
-    #     cursor = self.cnx.cursor()
-    #     cursor.execute(sql)
-    #     rows = cursor.fetchall()
-    #     cursor.close
-    #     return rows
-    #
-    # def getgenres_subsections(self, section_id):
-    #     sql = "select a.genre_id, a.subsection, count(*) as cnt from " + TBL_GENRES + " a, " + \
-    #           TBL_BGENRES + " b where a.genre_id=b.genre_id and section in (select section from " + TBL_GENRES + " where genre_id=" + str(
-    #         section_id) + ") group by a.subsection order by a.subsection"
-    #     cursor = self.cnx.cursor()
-    #     cursor.execute(sql)
-    #     rows = cursor.fetchall()
-    #     cursor.close
-    #     return rows
-    #
-    # def getbooksforgenre(self, genre_id, limit=0, page=0, doublicates=True):
-    #     if limit == 0:
-    #         limitstr = ""
-    #     else:
-    #         limitstr = "limit " + str(limit * page) + "," + str(limit)
-    #     if doublicates:
-    #         dstr = ''
-    #     else:
-    #         dstr = ' and a.doublicat=0 '
-    #     sql = "select SQL_CALC_FOUND_ROWS a.book_id,a.filename,a.path,a.registerdate,a.title,a.cover,a.cover_type from " + TBL_BOOKS + " a, " + TBL_BGENRES + " b where a.book_id=b.book_id and b.genre_id=" + str(
-    #         genre_id) + dstr + " order by a.lang desc, a.title " + limitstr
-    #     cursor = self.cnx.cursor()
-    #     cursor.execute(sql)
-    #     rows = cursor.fetchall()
-    #
-    #     cursor.execute("SELECT FOUND_ROWS()")
-    #     found_rows = cursor.fetchone()
-    #     if found_rows[0] > limit * page + limit:
-    #         self.next_page = True
-    #     else:
-    #         self.next_page = False
-    #
-    #     cursor.close
-    #     return rows
+    def getgenres_sections(self):
+        squery = self.session.query(book_genre.c.genre_id, sql.func.count(book_genre.c.book_id).label('book_count')).\
+            group_by(book_genre.c.genre_id).subquery()
+        rows = self.session.query(sql.func.min(Genre.genre_id), Genre.section, sql.func.sum(squery.c.book_count)).\
+            join(squery, Genre.genre_id == squery.c.genre_id).group_by(Genre.section).order_by(Genre.section).all()
+        return rows
+
+    def getgenres_subsections(self, section_id):
+        genre = self.session.query(Genre).get(section_id)
+        if not genre:
+            return tuple()
+        query = self.session.query(Genre.genre_id, Genre.subsection, sql.func.count(book_genre)).\
+            filter(Genre.genre_id == book_genre.c.genre_id, Genre.section == genre.section).\
+            group_by(Genre.genre_id, Genre.subsection).order_by(Genre.subsection)
+        rows = query.all()
+        return rows
+
+    def getbooksforgenre(self, genre_id, limit=0, page=0, doublicates=True):
+        query = self.session.query(Book.book_id, Book.filename, Book.path, Book.registerdate, Book.title, Book.cover,
+                                   Book.cover_type).filter(Book.book_id == book_genre.c.book_id,
+                                                           book_genre.c.genre_id == genre_id)
+        if not doublicates:
+            query = query.filter(Book.doublicat == 0)
+        query = query.order_by(Book.lang, Book.title)
+        if limit == 0:
+            rows = query.all()
+            self.next_page = False
+        else:
+            found_rows = query.count()
+            offset = limit * page
+            rows = query[offset:(offset+limit)]
+            self.next_page = (found_rows > (offset+limit))
+        return rows
 
     def getdbinfo(self, doublicates=True):
         query = self.session.query(sql.func.count(Book.book_id))
@@ -509,7 +477,7 @@ class opdsDatabase:
         return rows
 
     def zipisscanned(self, zipname):
-        _catalog = self.session.query(Catalog).filter(Catalog.path == zipname).first()
+        _catalog = self.session.query(Catalog).filter(Catalog.path == zipname).order_by(Catalog.cat_id).first()
         if not _catalog:
             cat_id = 0
         else:
@@ -644,6 +612,8 @@ class opdsDatabase:
 
 if __name__ == '__main__':
     import unittest
+    import time
+
     PATH = 'С:/Путь книги'
     FIRST = 'Первое Имя'
     LAST = 'Второе Имя'
@@ -667,19 +637,31 @@ if __name__ == '__main__':
             self.assertEqual(self.db.findbook(FILENAME, PATH_BOOK), 1)
 
         def test_finddouble(self):
-            self.assertEqual(self.db.finddouble(TILE_BOOK,FORMAT,SIZE_BOOK), 0)
-            self.db.session.add(Book(FILENAME, PATH_BOOK, 0, SIZE_BOOK, FORMAT, TILE_BOOK, '', 0, 1))
-            self.assertEqual(self.db.finddouble(TILE_BOOK,FORMAT,SIZE_BOOK), 0)
-            self.db.session.add(Book(FILENAME, PATH_BOOK, 0, SIZE_BOOK, FORMAT, TILE_BOOK, '', 0, 0))
-            self.assertEqual(self.db.finddouble(TILE_BOOK,FORMAT,SIZE_BOOK), 2)
+            self.assertEqual(self.db.finddouble(TILE_BOOK, FORMAT, SIZE_BOOK), 0)
+            self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, 'ru', SIZE_BOOK, 0, 0)
+            self.assertEqual(self.db.finddouble(TILE_BOOK, FORMAT, SIZE_BOOK), 1)
+            self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, 'ru', SIZE_BOOK, 0, 1)
+            self.assertEqual(self.db.finddouble(TILE_BOOK, FORMAT, SIZE_BOOK), 1)
 
         def test_addbook(self):
-            self.assertEqual(self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, SIZE_BOOK, TILE_BOOK, '', 0, 0), 1)
-            self.assertEqual(self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, SIZE_BOOK, TILE_BOOK, '', 0, 0), 1)
-            self.assertEqual(self.db.addbook(FILENAME, PATH_BOOK+'/', 0, '.'+FORMAT, SIZE_BOOK, TILE_BOOK, '', 0, 0), 2)
+            #name, path, cat_id, exten, title, lang, size=0, archive=0, doublicates=0
+            book_id = self.db.addbook(FILENAME, PATH_BOOK, 1, '.'+FORMAT, TILE_BOOK, 'ru', SIZE_BOOK, 2, 0)
+            self.assertEqual(book_id, 1)
+            book = self.db.session.query(Book).get(book_id)
+            self.assertEqual(book.filename, FILENAME)
+            self.assertEqual(book.path, PATH_BOOK)
+            self.assertEqual(book.cat_id, 1)
+            self.assertEqual(book.format, FORMAT)
+            self.assertEqual(book.title, TILE_BOOK)
+            self.assertEqual(book.lang, 'ru')
+            self.assertEqual(book.filesize, SIZE_BOOK)
+            self.assertEqual(book.cat_type, 2)
+            self.assertEqual(book.doublicat, 0)
+            self.assertEqual(self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0), 1)
+            self.assertEqual(self.db.addbook(FILENAME, PATH_BOOK+'/', 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0), 2)
 
         def test_addcover(self):
-            book_id = self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, SIZE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id = self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
             self.db.addcover(book_id, FILENAME, FORMAT)
             book = self.db.session.query(Book).filter(Book.book_id == book_id).one()
             self.assertEqual(book.cover, FILENAME)
@@ -690,7 +672,7 @@ if __name__ == '__main__':
             self.assertEqual(self.db.findauthor('', UNKNOWN_AUTHOR), 1)
 
         def test_findbauthor(self):
-            book_id = self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, SIZE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id = self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
             author_id = self.db.addauthor(FIRST, LAST)
             self.assertNotEqual(book_id, 0)
             self.assertNotEqual(author_id, 0)
@@ -706,7 +688,7 @@ if __name__ == '__main__':
             self.assertEqual(self.db.findauthor(FIRST, LAST), 2)
 
         def test_addbauthor(self):
-            book_id = self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, SIZE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id = self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
             author_id = self.db.addauthor(FIRST, LAST)
             self.assertNotEqual(book_id, 0)
             self.assertNotEqual(author_id, 0)
@@ -720,7 +702,7 @@ if __name__ == '__main__':
             self.assertEqual(self.db.findgenre('sf_humor'), 10)
 
         def test_findbgenre(self):
-            book_id = self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, SIZE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id = self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
             self.db.addbgenre(book_id, 10)
             self.db.addbgenre(book_id, 10)
             self.assertFalse(self.db.findbgenre(book_id, 1))
@@ -738,7 +720,7 @@ if __name__ == '__main__':
             self.assertEqual(genre.subsection, UNKNOWN_GENRE)
 
         def test_addbgenre(self):
-            book_id = self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, SIZE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id = self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
             self.assertNotEqual(book_id, 0)
             self.db.addbgenre(book_id, 10)
             self.db.addbgenre(book_id, 10)
@@ -774,59 +756,174 @@ if __name__ == '__main__':
         def test_getbooksincat(self):
             cat_id = self.db.addcattree(PATH_BOOK)
             self.assertEqual(len(self.db.getbooksincat(cat_id)), 0)
-            book_id = self.db.addbook(FILENAME, PATH_BOOK, cat_id, '.'+FORMAT, SIZE_BOOK, TILE_BOOK, '', 0, 0)
-            self.db.addbook(FILENAME, PATH_BOOK, cat_id, '.'+FORMAT, SIZE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id = self.db.addbook(FILENAME, PATH_BOOK, cat_id, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            self.db.addbook(FILENAME, PATH_BOOK, cat_id, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
             self.assertEqual(len(self.db.getbooksincat(cat_id)), 1)
             self.assertEqual(self.db.getbooksincat(cat_id)[0][0], book_id)
-            self.db.addbook(FILENAME, PATH_BOOK+'/', cat_id, '.'+FORMAT, SIZE_BOOK, TILE_BOOK, '', 0, 0)
+            self.db.addbook(FILENAME, PATH_BOOK+'/', cat_id, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
             self.assertEqual(len(self.db.getbooksincat(cat_id)), 2)
             self.assertEqual(len(self.db.getbooksincat(cat_id, 1)), 1)
             self.assertEqual(len(self.db.getbooksincat(cat_id, 1, 1)), 1)
             self.assertEqual(len(self.db.getbooksincat(cat_id, 2, 0)), 2)
 
         def test_getitemsincat(self):
-            pass
+            self.db.addcattree(PATH_BOOK)
+            cat_id = self.db.findcat(os.path.join(PATH, FIRST))
+            self.assertEqual(len(self.db.getitemsincat(cat_id)), 1)
+            self.db.addbook(FILENAME, PATH_BOOK, cat_id, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            self.assertEqual(len(self.db.getitemsincat(cat_id)), 2)
+            self.db.addbook(FILENAME, os.path.join(PATH, FIRST), cat_id, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            self.assertEqual(len(self.db.getitemsincat(cat_id)), 3)
+            self.db.addbook(FILENAME, os.path.join(PATH, FIRST), cat_id, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            self.assertEqual(len(self.db.getitemsincat(cat_id)), 3)
+            self.assertEqual(len(self.db.getitemsincat(cat_id, 1)), 1)
+            self.assertEqual(len(self.db.getitemsincat(cat_id, 1, 1)), 1)
+            self.assertEqual(len(self.db.getitemsincat(cat_id, 2, 0)), 2)
 
         def test_getbook(self):
-            pass
+            self.assertEqual(len(self.db.getbook(0)), 0)
+            book_id = self.db.addbook(FILENAME, PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            self.assertEqual(self.db.getbook(book_id)[0], FILENAME)
 
         def test_getauthors(self):
-            pass
+            book_id = self.db.addbook(FILENAME+'1', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, 'ru', SIZE_BOOK, 0, 0)
+            author_id = self.db.addauthor(FIRST, LAST)
+            self.db.addbauthor(book_id, author_id)
+            self.db.addbauthor(book_id, 1)
+            self.assertEqual(len(self.db.getauthors(book_id)), 2)
 
         def test_getgenres(self):
-            pass
+            book_id = self.db.addbook(FILENAME+'1', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, 'ru', SIZE_BOOK, 0, 0)
+            genre_id = self.db.findgenre('sf')
+            self.db.addbgenre(book_id, genre_id)
+            self.assertEqual(len(self.db.getgenres(book_id)), 1)
 
         def test_getauthor_2letters(self):
-            pass
+            self.assertEqual(len(self.db.getauthor_2letters(LAST[:2])), 0)
+            self.db.addauthor(FIRST, LAST)
+            self.db.addauthor(FIRST, LAST+'1')
+            rows = self.db.getauthor_2letters(LAST[:2])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][1], 2)
 
         def test_gettitle_2letters(self):
-            pass
+            self.assertEqual(len(self.db.gettitle_2letters(TILE_BOOK[:2])), 0)
+            self.db.addbook(FILENAME+'1', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, 'ru', SIZE_BOOK, 0, 0)
+            self.db.addbook(FILENAME+'2', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK+'1', 'ru', SIZE_BOOK, 0, 0)
+            self.db.addbook(FILENAME+'3', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK+'2', 'ru', SIZE_BOOK, 0, 0)
+            rows = self.db.gettitle_2letters(TILE_BOOK[:2])
+            self.assertEqual(rows[0][0], TILE_BOOK[:3])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][1], 3)
 
-        def getbooksfortitle(self):
-            pass
+        def test_getbooksfortitle(self):
+            #name, path, cat_id, exten, title, lang, size=0, archive=0, doublicates=0
+            book_id1 = self.db.addbook(FILENAME+'1', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, 'ru', SIZE_BOOK, 0, 0)
+            book_id2 = self.db.addbook(FILENAME+'2', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK+'1', 'ru', SIZE_BOOK, 0, 0)
+            book_id3 = self.db.addbook(FILENAME+'3', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK+'2', 'ru', SIZE_BOOK, 0, 0)
+            self.assertEqual(len(self.db.getbooksfortitle(TILE_BOOK)), 3)
 
         def test_getauthorsbyl(self):
-            pass
+            self.assertEqual(len(self.db.getauthorsbyl(FIRST)), 0)
+            book_id1 = self.db.addbook(FILENAME+'1', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id2 = self.db.addbook(FILENAME+'2', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id3 = self.db.addbook(FILENAME+'3', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            author_id1 = self.db.addauthor(FIRST, LAST)
+            author_id2 = self.db.addauthor(FIRST, FIRST)
+            self.db.addbauthor(book_id1, author_id1)
+            self.db.addbauthor(book_id1, author_id2)
+            self.db.addbauthor(book_id2, author_id1)
+            self.db.addbauthor(book_id3, author_id2)
+            rows = self.db.getauthorsbyl(LAST)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][3], 2)
+            self.assertEqual(len(self.db.getauthorsbyl(FIRST)), 1)
 
         def test_getbooksforautor(self):
-            pass
+            self.assertEqual(len(self.db.getbooksforautor(1)), 0)
+            book_id1 = self.db.addbook(FILENAME+'1', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id2 = self.db.addbook(FILENAME+'2', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id3 = self.db.addbook(FILENAME+'3', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            author_id = self.db.addauthor(FIRST, LAST)
+            self.db.addbauthor(book_id1, author_id)
+            self.db.addbauthor(book_id1, 1)
+            self.db.addbauthor(book_id2, author_id)
+            self.db.addbauthor(book_id3, 1)
+            self.assertEqual(len(self.db.getbooksforautor(1)), 2)
+            self.assertEqual(len(self.db.getbooksforautor(author_id)), 2)
 
         def test_getlastbooks(self):
-            pass
+            book_id1 = self.db.addbook(FILENAME+'1', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            time.sleep(1)
+            book_id2 = self.db.addbook(FILENAME+'2', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            time.sleep(1)
+            book_id3 = self.db.addbook(FILENAME+'3', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            rows = self.db.getlastbooks()
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(rows[0][0], book_id3)
+            self.assertEqual(rows[1][0], book_id2)
+            self.assertEqual(rows[2][0], book_id1)
+            self.assertEqual(len(self.db.getlastbooks(2)), 2)
 
         def test_getgenres_sections(self):
-            pass
+            self.assertEqual(len(self.db.getgenres_sections()), 0)
+            book_id1 = self.db.addbook(FILENAME+'1', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id2 = self.db.addbook(FILENAME+'2', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id3 = self.db.addbook(FILENAME+'3', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            genre_id1 = self.db.findgenre('sf_humor')
+            genre_id2 = self.db.findgenre('det_classic')
+            genre_id3 = self.db.findgenre('sf')
+            self.db.addbgenre(book_id1, genre_id1)
+            self.db.addbgenre(book_id1, genre_id3)
+            self.db.addbgenre(book_id2, genre_id1)
+            self.db.addbgenre(book_id3, genre_id2)
+            rows = self.db.getgenres_sections()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[1][0], genre_id1)
+            self.assertEqual(rows[1][2], 3)
+            self.assertEqual(rows[0][0], genre_id2)
+            self.assertEqual(rows[0][2], 1)
 
         def test_getgenres_subsections(self):
-            pass
+            genre_id3 = self.db.findgenre('sf_humor')
+            self.assertEqual(len(self.db.getgenres_subsections(genre_id3)), 0)
+            book_id1 = self.db.addbook(FILENAME+'1', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id2 = self.db.addbook(FILENAME+'2', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id3 = self.db.addbook(FILENAME+'3', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            genre_id1 = self.db.findgenre('sf_history')
+            genre_id2 = self.db.findgenre('det_classic')
+            self.db.addbgenre(book_id1, genre_id1)
+            self.db.addbgenre(book_id1, genre_id3)
+            self.db.addbgenre(book_id2, genre_id1)
+            self.db.addbgenre(book_id3, genre_id2)
+            rows = self.db.getgenres_subsections(genre_id1)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0][0], genre_id1)
+            self.assertEqual(rows[0][2], 2)
+            self.assertEqual(rows[1][0], genre_id3)
+            self.assertEqual(rows[1][2], 1)
 
         def test_getbooksforgenre(self):
-            pass
+            genre_id3 = self.db.findgenre('sf_humor')
+            self.assertEqual(len(self.db.getbooksforgenre(genre_id3)), 0)
+            book_id1 = self.db.addbook(FILENAME+'1', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id2 = self.db.addbook(FILENAME+'2', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            book_id3 = self.db.addbook(FILENAME+'3', PATH_BOOK, 0, '.'+FORMAT, TILE_BOOK, TILE_BOOK, '', 0, 0)
+            genre_id1 = self.db.findgenre('sf_history')
+            genre_id2 = self.db.findgenre('det_classic')
+            self.db.addbgenre(book_id1, genre_id1)
+            self.db.addbgenre(book_id1, genre_id3)
+            self.db.addbgenre(book_id2, genre_id1)
+            self.db.addbgenre(book_id3, genre_id2)
+            self.assertEqual(len(self.db.getbooksforgenre(genre_id1)), 2)
+            self.assertEqual(len(self.db.getbooksforgenre(genre_id2)), 1)
+            self.assertEqual(len(self.db.getbooksforgenre(genre_id3)), 1)
 
         def test_getdbinfo(self):
             self.assertEqual(self.db.getdbinfo(), [(0,), (1,), (0,)])
 
         def test_zipisscanned(self):
-            pass
+            cat_id = self.db.addcattree(os.path.join(PATH_BOOK, 'file.zip'))
+            self.assertEqual(self.db.zipisscanned(os.path.join(PATH_BOOK, 'file.zip')), cat_id)
 
     unittest.main()
