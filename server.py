@@ -7,30 +7,12 @@ from urllib.parse import parse_qs
 import time
 from wsgiref.validate import validator
 from wsgiref.simple_server import make_server
+import zipfile
 
-import db as sopdsdb
+import db
+from utils import CfgReader
 
-
-class Config():
-    SITE_ID = ''
-    SITE_ICON = ''
-    SITE_TITLE = ''
-    SITE_AUTOR = ''
-    SITE_URL = ''
-    SITE_EMAIL = ''
-    SITE_MAINTITLE = ''
-    DB_NAME = 'sqlite:///:memory:'
-    DB_USER = ''
-    DB_PASS = ''
-    DB_HOST = ''
-
-    ROOT_LIB = ''
-    DUBLICATES_SHOW = 0
-    MAXITEMS = 10
-    SPLITTITLES = 0
-    COVER_SHOW = 0
-
-cfg = Config()
+cfg = CfgReader()
 
 
 #######################################################################
@@ -154,19 +136,19 @@ def list_of_catlogs(id_value, slice_value, page_value):
                                                                                                  cfg.MAXITEMS,
                                                                                                  page_value):
         if item_type == 1:
-            id = '01' + str(item_id)
+            _id = '01' + str(item_id)
         elif item_type == 2:
-            id = '07' + str(item_id)
+            _id = '07' + str(item_id)
         else:
-            id = '00'
+            _id = '00'
         ret += enc_print('<entry>')
         ret += enc_print('<title>' + item_title + '</title>')
         ret += enc_print('<updated>' + reg_date.strftime("%Y-%m-%dT%H:%M:%SZ") + '</updated>')
         ret += enc_print('<id>/?id=00</id>')
-        ret += enc_print('<link type="application/atom+xml" rel="alternate" href="/?id=' + id + '"/>')
+        ret += enc_print('<link type="application/atom+xml" rel="alternate" href="/?id=' + _id + '"/>')
         ret += enc_print(
             '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="subsection" href="/?id='
-            + id + '"/>')
+            + _id + '"/>')
         if item_type == 2:
             authors = ""
             for (first_name, last_name) in opdsdb.getauthors(item_id):
@@ -533,7 +515,6 @@ def list_of_ref(id_value, slice_value):
 # Выдача файла книги
 #
 def out_file_of_book(slice_value):
-    return ''
     (book_name, book_path, reg_date, format, title, cat_type, cover, cover_type, fsize) = opdsdb.getbook(slice_value)
     full_path = os.path.join(cfg.ROOT_LIB, book_path)
     transname = translit(book_name)
@@ -541,28 +522,23 @@ def out_file_of_book(slice_value):
     head = enc_print('Content-Type:application/octet-stream; name="' + book_name + '"')
     head += enc_print("Content-Disposition: attachment; filename=" + transname)
     head += enc_print('Content-Transfer-Encoding: binary')
-    if cat_type == sopdsdb.CAT_NORMAL:
+    if cat_type == db.CAT_NORMAL:
         file_path = os.path.join(full_path, book_name)
         book_size = os.path.getsize(file_path.encode('utf-8'))
         head += enc_print('Content-Length: ' + str(book_size))
         head += enc_print()
-        fo = codecs.open(file_path.encode("utf-8"), "rb")
-        string = fo.read()
-        sys.stdout.buffer.write(string)
+        fo = open(file_path, "rb")
+        ret = fo.read()
         fo.close()
-    elif cat_type == sopdsdb.CAT_ZIP:
-        # fz = codecs.open(full_path.encode("utf-8"), "rb")
-        # z = zipf.ZipFile(fz, 'r', allowZip64=True, codepage=cfg.ZIP_CODEPAGE)
-        # book_size = z.getinfo(book_name).file_size
-        # enc_print('Content-Length: ' + str(book_size))
-        # enc_print()
-        # fo = z.open(book_name)
-        # str = fo.read()
-        # sys.stdout.buffer.write(str)
-        # fo.close()
-        # z.close()
-        # fz.close()
-        pass
+    elif cat_type == db.CAT_ZIP:
+        z = zipfile.ZipFile(full_path, 'r', allowZip64=True)
+        book_size = z.getinfo(book_name).file_size
+        head += enc_print('Content-Length: ' + str(book_size))
+        fo = z.open(book_name)
+        ret = fo.read()
+        fo.close()
+        z.close()
+    return head, ret
 
 
 #########################################################
@@ -577,7 +553,7 @@ def out_zipfile_of_book():
     # enc_print('Content-Type:application/zip; name="' + book_name + '"')
     # enc_print("Content-Disposition: attachment; filename=" + transname + '.zip')
     # enc_print('Content-Transfer-Encoding: binary')
-    # if cat_type == sopdsdb.CAT_NORMAL:
+    # if cat_type == db.CAT_NORMAL:
     #     file_path = os.path.join(full_path, book_name)
     #     dio = io.BytesIO()
     #     z = zipf.ZipFile(dio, 'w', zipf.ZIP_DEFLATED)
@@ -587,7 +563,7 @@ def out_zipfile_of_book():
     #     enc_print('Content-Length: %s' % len(buf))
     #     enc_print()
     #     sys.stdout.buffer.write(buf)
-    # elif cat_type == sopdsdb.CAT_ZIP:
+    # elif cat_type == db.CAT_ZIP:
     #     fz = codecs.open(full_path.encode("utf-8"), "rb")
     #     zi = zipf.ZipFile(fz, 'r', allowZip64=True, codepage=cfg.ZIP_CODEPAGE)
     #     fo = zi.open(book_name)
@@ -619,12 +595,12 @@ def get_cover():
     # if format == 'fb2':
     #     full_path = os.path.join(cfg.ROOT_LIB, book_path)
     #     fb2 = sopdsparse.fb2parser(1)
-    #     if cat_type == sopdsdb.CAT_NORMAL:
+    #     if cat_type == db.CAT_NORMAL:
     #         file_path = os.path.join(full_path, book_name)
     #         fo = codecs.open(file_path.encode("utf-8"), "rb")
     #         fb2.parse(fo, 0)
     #         fo.close()
-    #     elif cat_type == sopdsdb.CAT_ZIP:
+    #     elif cat_type == db.CAT_ZIP:
     #         fz = codecs.open(full_path.encode("utf-8"), "rb")
     #         z = zipf.ZipFile(fz, 'r', allowZip64=True, codepage=cfg.ZIP_CODEPAGE)
     #         fo = z.open(book_name)
@@ -736,8 +712,9 @@ def simple_app(environ, start_response):
                list_of_ref(id_value, slice_value).encode('utf-8'),
                footer().encode('utf-8')]
     elif type_value == 8:
-        ret = [header().encode('utf-8'),
-               out_file_of_book(slice_value).encode('utf-8'),
+        head, ret = out_file_of_book(slice_value)
+        ret = [head.encode('utf-8'),
+               ret,
                footer().encode('utf-8')]
     elif type_value == 9:
         ret = [header().encode('utf-8'),
@@ -755,10 +732,8 @@ def simple_app(environ, start_response):
     return ret
 
 
-opdsdb = sopdsdb.opdsDatabase(cfg.DB_NAME, cfg.DB_USER, cfg.DB_PASS, cfg.DB_HOST, cfg.ROOT_LIB)
+opdsdb = db.opdsDatabase(cfg.ENGINE+cfg.DB_NAME, cfg.DB_USER, cfg.DB_PASS, cfg.DB_HOST, cfg.ROOT_LIB)
 opdsdb.openDB()
-opdsdb.init_db()
-opdsdb.addcattree('C:/TEMP/TEXT/BOOK')
 
 validator_app = validator(simple_app)
 httpd = make_server('', 8000, validator_app)
