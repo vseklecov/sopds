@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
 __author__ = 'vseklecov'
 
+##########################################################################
+# типы каталогов (cat_type)
+#
+CAT_NORMAL=0
+CAT_ZIP=1
+CAT_GZ=2
+
 UNKNOWN_GENRE = 'Неизвестный жанр'
 UNKNOWN_AUTHOR = 'Неизвестный автор'
 
@@ -343,6 +350,9 @@ class opdsDatabase:
             return tuple()
         return (book.filename, book.path, book.registerdate, book.format, book.title, book.cat_type,
                 book.cover, book.cover_type, book.filesize)
+
+    def _getbook(self, book_id):
+        return self.session.query(Book).get(book_id)
 
     def getauthors(self, book_id):
         book = self.session.query(Book).get(book_id)
