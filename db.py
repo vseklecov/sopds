@@ -47,13 +47,14 @@ class Book(Base):
     cover = sql.Column(sql.String(32))
     cover_type = sql.Column(sql.String(32))
     doublicat = sql.Column(sql.Integer, nullable=False, default=0)
+    annotation = sql.Column(sql.String)
     search_title = sql.Column(sql.String(256), index=True)
 
     authors = orm.relationship('Author', secondary=book_authors, backref='books')
     genres = orm.relationship('Genre', secondary=book_genre, backref='books')
 
     def __init__(self, file_name='fn', path='/', cat_id=0, format_book='fb2', title='title', lang='ru',
-                 size=0, archive=0, doublicat=0):
+                 size=0, archive=0, doublicat=0, annotation=''):
         self.filename = file_name
         self.path = path
         self.cat_id = cat_id
@@ -63,6 +64,7 @@ class Book(Base):
         self.lang = lang
         self.cat_type = archive
         self.doublicat = doublicat
+        self.annotation = annotation
         self.search_title = self.title.lower()
 
     def cat_normal(self):

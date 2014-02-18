@@ -1,7 +1,9 @@
 __author__ = 'vseklecov'
 
+import base64
 import configparser
 import inspect
+import mimetypes
 import os
 import xml.etree.ElementTree as ET
 
@@ -29,6 +31,7 @@ class CfgReader:
         self.DB_CHARSET = config.get(CFG_G, 'db_charset', fallback='utf-8')
 
         self.ROOT_LIB = os.path.abspath(config.get(CFG_G, 'root_lib', fallback=r'\documents\books'))
+        self.COVER_PATH = os.path.abspath(config.get(CFG_G, 'cover_path', fallback=r'\documents\covers'))
         self.FORMATS = config.get(CFG_G, 'formats', fallback='.pdf .djvu .fb2 .txt')
         self.DUBLICATES_FIND = config.getboolean(CFG_G, 'dublicates_find', fallback=True)
         self.DUBLICATES_SHOW = config.getboolean(CFG_G, 'dublicates_show', fallback=False)
@@ -62,6 +65,77 @@ class CfgReader:
         self.SITE_URL = config.get(CFG_S, 'url', fallback='http://home')
         self.SITE_EMAIL = config.get(CFG_S, 'email', fallback='victor@home')
         self.SITE_MAINTITLE = config.get(CFG_S, 'main_title', fallback='Root of Simple OPDS Catalog')
+
+
+
+class Author:
+    def __init__(self, author):
+        ns = self.author.tag.split('}')[0][1:]
+        last_name = author.findtext(ET.QName(ns, 'last-name').text, '').strip(' \'\"\&()-.#[]\\\`')
+        first_name = author.findtext(ET.QName(ns, 'first-name').text, '').strip(' \'\"\&()-.#[]\\\`')
+        nickname = author.findtext(ET.QName(ns, 'nickname').text, '').strip(' \'\"\&()-.#[]\\\`')
+        if (len(last_name) + len(first_name)) == 0:
+            self.last_name = nickname
+        else:
+            self.first_name = first_name
+            self.last_name = last_name
+
+
+class Image:
+    def __init__(self, root, image):
+        _id = image.get('{http://www.w3.org/1999/xlink}href')
+        if _id[0] == '#':
+            binary = root.find("*/[@id='{:s}']".format(_id[1:]))
+            if binary:
+                self.content_type = binary.get('content-type').lower()
+                self.image = base64.b64decode(binary.text)
+        else:
+            self.content_type = ''
+
+
+class FictionBook:
+
+    def __init__(self, filename):
+        if isinstance(filename, str):
+            if os.path.exists(filename):
+                try:
+                    self.tree = ET.parse(filename)
+                    self.parsed = True
+                except ET.ParseError:
+                    self.parsed = False
+            else:
+                self.parsed = False
+        elif hasattr(filename, 'read'):
+            try:
+                self.tree = ET.fromstring(filename.read())
+                self.parsed = True
+            except ET.ParseError:
+                self.parsed = False
+        else:
+            self.parsed = False
+        if self.parsed:
+            self.root = self.tree.getroot()
+            ns = self.root.tag.split('}')[0][1:]
+            desc = self.root.find(ET.QName(ns, 'description').text)
+            ti = desc.find(ET.QName(ns, 'title-info').text)
+            self.genres = []
+            for genre in ti.iter(ET.QName(ns, 'genre').text):
+                self.genres.append(genre.text.lower().strip(' \'\"\&()-.#[]\\\`'))
+            self.authors = [Author(author) for author in ti.iter(ET.QName(ns, 'author').text)]
+            self.lang = ti.findtext(ET.QName(ns, 'lang').text, 'ru').strip(' \'\"')
+            self.title = ti.findtext(ET.QName(ns, 'book-title').text, '').strip(' \'\"\&()-.#[]\\\`')
+            self.annotation = ET.tostring(ti.findtext(ET.QName(ns, 'annotation').text, ''), 'unicode', 'text')
+            coverpage = ti.find(ET.QName(ns, 'coverpage').text)
+            if coverpage:
+                image = coverpage.find(ET.QName(ns, 'image').text)
+                if image:
+                    self.cover = Image(self.root, image)
+            sequence = ti.find(ET.QName(ns, 'sequence').text)
+            if sequence:
+                self.name_sequence = sequence.get('name')
+                self.number_in_seq = sequence.get('number')
+            else:
+                self.name_sequence = ''
 
 
 def fb2parse(filename):
@@ -100,23 +174,25 @@ def processfile(dbase, name, full_path, filename, cfg, archive=0, file_size=0, c
     if dbase.findbook(name, rel_path) == 0:
         if archive == 0:
             cat_id = dbase.addcattree(rel_path, archive)
-        title = ''
-        lang = ''
-        (n, e) = os.path.splitext(name)
-        if e.lower() == '.fb2' and cfg.FB2PARSE:
-            book = fb2parse(filename)
-            lang = book['lang'].strip(' \'\"')
-            title = book['book_title'].strip(' \'\"\&()-.#[]\\\`')
-            book_id = dbase.addbook(name, rel_path, cat_id, e, title, lang, file_size, archive, cfg.DUBLICATES_FIND)
-
-            for author in book['authors']:
-                last_name = author['last_name'].strip(' \'\"\&()-.#[]\\\`')
-                first_name = author['first_name'].strip(' \'\"\&()-.#[]\\\`')
-                author_id = dbase.addauthor(first_name, last_name)
+        (n, ext) = os.path.splitext(name)
+        if ext.lower() == '.fb2' and cfg.FB2PARSE:
+            fb = FictionBook(filename)
+            book_id = dbase.addbook(name, rel_path, cat_id, ext, fb.title, fb.lang, file_size, archive,
+                                    cfg.DUBLICATES_FIND, fb.annotation)
+            for author in fb.authors:
+                author_id = dbase.addauthor(author.first_name, author.last_name)
                 dbase.addbauthor(book_id, author_id)
-
-            for genre in book['genres']:
-                dbase.addbgenre(book_id, dbase.addgenre(genre.lower().strip(' \'\"\&()-.#[]\\\`')))
+            for genre in fb.genres:
+                dbase.addbgenre(book_id, dbase.addgenre(genre))
+            if cfg.COVER_EXTRACT:
+                ext = mimetypes.guess_extension(fb.cover.content_type)
+                if ext:
+                    fn = str(book_id) + ext
+                    fp = os.path.join(cfg.COVER_PATH, fn)
+                    img = open(fp, 'wb')
+                    img.write(fb.cover.image)
+                    img.close()
+                    dbase.addcover(book_id, fn, fb.cover.content_type)
 
 
 if __name__ == '__main__':
@@ -147,8 +223,8 @@ if __name__ == '__main__':
         print(dbase.print_db_err())
 
     if cfg.COVER_EXTRACT:
-        if not os.path.isdir(os.path.join(PY_PATH,'covers')):
-            os.mkdir(os.path.join(PY_PATH,'covers'))
+        if not os.path.isdir(cfg.COVER_PATH):
+            os.mkdir(cfg.COVER_PATH)
 
     ext_set = {x for x in cfg.EXT_LIST}
     if args.verbose:
@@ -157,9 +233,10 @@ if __name__ == '__main__':
     for full_path, dirs, files in os.walk(cfg.ROOT_LIB):
         for name in files:
             fn = os.path.join(full_path, name)
-            (n, e) = os.path.splitext(name)
-            if e.lower() == '.zip' and cfg.ZIPSCAN:
+            (n, ext) = os.path.splitext(name)
+            if ext.lower() == '.zip' and cfg.ZIPSCAN:
                 processzip(dbase, name, full_path, fn)
-            elif e.lower() in ext_set:
+            elif ext.lower() in ext_set:
                 processfile(dbase, name, full_path, fn, cfg)
+
     dbase.close_db()
