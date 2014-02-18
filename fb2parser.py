@@ -26,6 +26,8 @@ def fb2parse(filename):
 
     ret['lang'] = title_info.findtext(ET.QName(ns, 'lang').text, '')
     ret['book_title'] = title_info.findtext(ET.QName(ns, 'book-title').text, '')
+    ret['cover_name'] = ''
+    ret['cover_image'] = ''
 
     return ret
 
@@ -82,10 +84,10 @@ if __name__ == '__main__':
         cfg = utils.CfgReader()
 
     dbase = db.opdsDatabase(cfg.ENGINE+cfg.DB_NAME, cfg.DB_USER, cfg.DB_PASS, cfg.DB_HOST, cfg.ROOT_LIB)
-    dbase.openDB()
+    dbase.open_db()
 
     if args.verbose:
-        print(dbase.printDBerr())
+        print(dbase.print_db_err())
 
     if cfg.COVER_EXTRACT:
         if not os.path.isdir(os.path.join(utils.PY_PATH,'covers')):
@@ -103,7 +105,7 @@ if __name__ == '__main__':
                 processzip(dbase, name, full_path, fn)
             elif e.lower() in ext_set:
                 processfile(dbase, name, full_path, fn, cfg)
-    dbase.closeDB()
+    dbase.close_db()
 
     # if len(sys.argv) == 1:
     #     for fn in os.listdir('.'):

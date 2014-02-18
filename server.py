@@ -1,20 +1,41 @@
 # -*- coding: utf-8 -*-
+from fb2parser import fb2parse
+
 __author__ = 'vseklecov'
 
-import codecs
-
+import base64
+import io
 import logging
 import os
 from urllib.parse import parse_qs
-import time
 from wsgiref.validate import validator
 from wsgiref.simple_server import make_server
 import zipfile
 
+import fb2parser
 import db as sopdsdb
 from utils import CfgReader
 
 cfg = CfgReader()
+
+MAIN_MENU = 0
+LIST_CAT = 1
+LIST_AUTHORS_CNT = 2
+LIST_TITLE_CNT = 3
+LIST_GENRE_CNT = 11
+LIST_GENRE_SUB_CNT = 12
+LIST_AUTHOR_CNT = 5
+
+LIST_TITLE_SEARCH = 10
+LIST_LAST = 4
+LIST_BOOK = 6
+LIST_SUBSECTION = 13
+
+BOOK = 7
+
+OUT_BOOK = 8
+OUT_ZIP_BOOK = 9
+OUT_COVER = 99
 
 
 class Link:
@@ -60,490 +81,329 @@ def translit(s):
     return s.translate(table1)
 
 
-def websym(s):
-    """Replace special web-symbols"""
-    result = s
-    table = {'&': '&amp;', '<': '&lt;'}
-    for k in table.keys():
-        result = result.replace(k, table[k])
-    return result
-
-
-def enc_print(string=''):
-    #    return string.encode(encoding) + b'\n'
-    return string + '\n'
-
-
-def header():
-    #    ret += enc_print('Content-Type: text/xml; charset='+charset)
-    #    ret += enc_print()
-    ret = enc_print('<?xml version="1.0" encoding="utf-8"?>')
-    ret += enc_print('<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/">')
-    ret += enc_print('<id>' + cfg.SITE_ID + '</id>')
-    ret += enc_print('<title>' + cfg.SITE_TITLE + '</title>')
-    ret += enc_print('<updated>' + time.strftime("%Y-%m-%dT%H:%M:%SZ") + '</updated>')
-    ret += enc_print('<icon>' + cfg.SITE_ICON + '</icon>')
-    ret += enc_print(
-        '<author><name>' + cfg.SITE_AUTOR + '</name><uri>' + cfg.SITE_URL + '</uri><email>' + cfg.SITE_EMAIL + '</email></author>')
-    #   ret += enc_print('<cover_show>'+str(cfg.COVER_SHOW)+'</cover_show>')
-    return ret
-
-
-def footer():
-    return enc_print('</feed>')
-
-
-def makeFeed():
+def make_feed():
     _author = dict(name=cfg.SITE_AUTOR, uri=cfg.SITE_URL, email=cfg.SITE_EMAIL)
     _feed = pyatom.OPDSAtomFeed(id=cfg.SITE_ID, title=cfg.SITE_TITLE, icon=cfg.SITE_ICON, author=_author)
     _feed.links.append(NavigationLink('/', rel='start', title=cfg.SITE_MAINTITLE).to_dict())
     return _feed
 
 
+def make_entry_book(book):
+    _authors = [dict(name=str(author)) for author in book.authors]
+    _entry = pyatom.FeedEntry(title=pyatom.escape(book.title),
+                              updated=book.registerdate,
+                              id='list:book:{0:d}'.format(book.book_id),
+                              content_type='text',
+                              content=', '.join([str(author) for author in book.authors]),
+                              author=_authors)
+    _id = '/?id=07{0:d}'.format(book.book_id)
+    _entry.links.append(Link(_id, rel='alternate').to_dict())
+    _entry.links.append(AsqusitionLink(_id, rel='subsection').to_dict())
+    _entry.links.extend(covers(book.cover, book.cover_type, book.book_id))
+    return _entry
+
+
+def make_href(id_value, slice_value=None, page_value=None):
+    ret = '/?id={:02d}'.format(id_value)
+    if slice_value:
+        ret += '{:d}'.format(slice_value)
+    if page_value:
+        ret += '&amp;page={:d}'.format(page_value)
+    return ret
+
+
+def make_book(book):
+    href_1 = make_href(OUT_BOOK, book.book_id)
+    href_2 = make_href(OUT_ZIP_BOOK, book.book_id)
+    _content = 'Название книги: {:s}\nАвтор(ы): {:s}\nЖанры: {:s}\nРазмер файла : {:d} Кб'. \
+        format(book.title, ', '.join([str(author) for author in book.authors]),
+               ', '.join([genre.subsection for genre in book.genres]), book.filesize // 1000)
+    _entry = pyatom.FeedEntry(title=pyatom.escape(book.title, True) or book.filename,
+                              id='main:book:{:d}'.format(book.book_id),
+                              updated=book.registerdate,
+                              author=[dict(name=str(author)) for author in book.authors],
+                              content_type='text',
+                              content=_content)
+    _entry.links.append(Link(href_1, _type='application/' + book.format, rel='alternate').to_dict())
+    _entry.links.append(Link(href_1, _type='application/' + book.format,
+                             rel='http://opds-spec.org/acquisition').to_dict())
+    _entry.links.append(Link(href_2, _type='application/' + book.format + '+zip',
+                             rel='http://opds-spec.org/acquisition').to_dict())
+    _entry.links.extend(covers(book.cover, book.cover_type, book.book_id))
+    return _entry
+
+
 def add_previous_link(feed, id_value, page_value):
-    feed.links.append(AsqusitionLink('/?id=' + id_value + '&amp;page=' + str(page_value - 1),
+    feed.links.append(AsqusitionLink(make_href(id_value, page_value=page_value - 1),
                                      rel='prev', title='Previous page').to_dict())
 
 
 def add_next_link(feed, id_value, page_value):
-    feed.links.append(AsqusitionLink('/?id=' + id_value + '&amp;page=' + str(page_value + 1),
+    feed.links.append(AsqusitionLink(make_href(id_value, page_value=page_value + 1),
                                      rel='next', title='Next page').to_dict())
 
 
+def letter_from_slice(slice_value):
+    i = slice_value
+    letter = ""
+    while i > 0:
+        letter = chr(i % 10000) + letter
+        i //= 10000
+    return letter
+
+
+def slice_from_letter(letters):
+    _slice = ''
+    for ch in letters:
+        _slice += '{:04d}'.format(ord(ch))
+    return _slice
+
+
 ###########################################################################################################
-# Основной меню
+# Основное меню
 #
 def main_menu():
-    dbinfo = opdsdb.getdbinfo(cfg.DUBLICATES_SHOW)
-    _catalogs = dbinfo[2][0]
-    _authors = dbinfo[1][0]
-    _books = dbinfo[0][0]
+    _books, _authors, _catalogs = opdsdb.getdbinfo(cfg.DUBLICATES_SHOW)
 
-    _feed = makeFeed()
+    _feed = make_feed()
     _feed.links.append(Link('opensearch.xml', type='application/opensearchdescription+xml', rel='search').to_dict())
     _feed.links.append(Link('/?search={searchTerms}', rel='search').to_dict())
 
-    _link = NavigationLink('/?id=01')
-    _entry = pyatom.FeedEntry(title='По каталогам', id='main:catalogs', content_type='text',
-                              content='Каталогов: {0:d}, книг: {1:d}.'.format(_catalogs, _books),
-                              links=[_link.to_dict()])
-    _feed.add(_entry)
+    _feed.add(pyatom.FeedEntry(title='По каталогам', id='main:catalogs', content_type='text',
+                               content='Каталогов: {:d}, книг: {:d}.'.format(_catalogs, _books),
+                               links=[NavigationLink(make_href(LIST_CAT)).to_dict()]))
 
-    _link = NavigationLink('/?id=02')
-    _entry = pyatom.FeedEntry(title='По авторам', id='main:authors', content_type='text',
-                              content='Авторов: {0:d}, книг: {1:d}.'.format(_authors, _books),
-                              links=[_link.to_dict()])
-    _feed.add(_entry)
+    _feed.add(pyatom.FeedEntry(title='По авторам', id='main:authors', content_type='text',
+                               content='Авторов: {0:d}, книг: {1:d}.'.format(_authors, _books),
+                               links=[NavigationLink(make_href(LIST_AUTHORS_CNT)).to_dict()]))
 
-    _link = NavigationLink('/?id=03')
-    _entry = pyatom.FeedEntry(title='По наименованию', id='main:titles', content_type='text',
-                              content='Авторов: {0:d}, книг: {1:d}.'.format(_authors, _books),
-                              links=[_link.to_dict()])
-    _feed.add(_entry)
+    _feed.add(pyatom.FeedEntry(title='По наименованию', id='main:titles', content_type='text',
+                               content='Авторов: {0:d}, книг: {1:d}.'.format(_authors, _books),
+                               links=[NavigationLink(make_href(LIST_TITLE_CNT)).to_dict()]))
 
-    _link = NavigationLink('/?id=11')
-    _entry = pyatom.FeedEntry(title='По жанрам', id='main:genres', content_type='text',
-                              content='Авторов: {0:d}, книг: {1:d}.'.format(_authors, _books),
-                              links=[_link.to_dict()])
-    _feed.add(_entry)
+    _feed.add(pyatom.FeedEntry(title='По жанрам', id='main:genres', content_type='text',
+                               content='Авторов: {0:d}, книг: {1:d}.'.format(_authors, _books),
+                               links=[NavigationLink(make_href(LIST_GENRE_CNT)).to_dict()]))
 
-    _link = NavigationLink('/?id=04')
-    _entry = pyatom.FeedEntry(title='Последние добавленные', id='main:last', content_type='text',
-                              content='Книг: {0:d}.'.format(min(cfg.MAXITEMS, _books)),
-                              links=[_link.to_dict()])
-    _feed.add(_entry)
-
+    _feed.add(pyatom.FeedEntry(title='Последние добавленные', id='main:last', content_type='text',
+                               content='Книг: {0:d}.'.format(min(cfg.MAXITEMS, _books)),
+                               links=[NavigationLink(make_href(LIST_LAST)).to_dict()]))
     return _feed
 
 
 def covers(cover, cover_type, book_id):
     have_extracted_cover = 0
-    ret = ''
+    links = []
     if cfg.COVER_SHOW != 0:
         if cfg.COVER_SHOW != 2:
             if cover and cover != '':
-                ret += enc_print(
-                    '<link href="../covers/%s" rel="http://opds-spec.org/image" type="%s" />' % (cover, cover_type))
-                ret += enc_print(
-                    '<link href="../covers/%s" rel="x-stanza-cover-image" type="%s" />' % (cover, cover_type))
-                ret += enc_print(
-                    '<link href="../covers/%s" rel="http://opds-spec.org/thumbnail" type="%s" />' % (cover, cover_type))
-                ret += enc_print(
-                    '<link href="../covers/%s" rel="x-stanza-cover-image-thumbnail" type="%s" />' % (cover, cover_type))
+                _id = '../covers/{0:s}'.format(cover)
+                links.append(Link(_id, rel='http://opds-spec.org/image', _type=cover_type).to_dict())
+                links.append(Link(_id, rel='x-stanza-cover-image', _type=cover_type).to_dict())
+                links.append(Link(_id, rel='http://opds-spec.org/thumbnail', _type=cover_type).to_dict())
+                links.append(Link(_id, rel='x-stanza-cover-image-thumbnail', _type=cover_type).to_dict())
                 have_extracted_cover = 1
         if cfg.COVER_SHOW == 2 or (cfg.COVER_SHOW == 3 and have_extracted_cover == 0):
-            _id = '99' + str(book_id)
-            ret += enc_print('<link href="/?id=%s" rel="http://opds-spec.org/image" />' % (_id))
-            ret += enc_print('<link href="/?id=%s" rel="x-stanza-cover-image" />' % (_id))
-            ret += enc_print('<link href="/?id=%s" rel="http://opds-spec.org/thumbnail" />' % (_id))
-            ret += enc_print('<link href="/?id=%s" rel="x-stanza-cover-image-thumbnail" />' % (_id))
-    return ret
+            _id = make_href(OUT_COVER, book_id)
+            links.append(dict(href=_id, rel='http://opds-spec.org/image'))
+            links.append(dict(href=_id, rel='x-stanza-cover-image'))
+            links.append(dict(href=_id, rel='http://opds-spec.org/thumbnail'))
+            links.append(dict(href=_id, rel='x-stanza-cover-image-thumbnail'))
+    return links
 
 
 #########################################################
 # Выбрана сортировка "По каталогам"
 #
-def list_of_catalogs(id_value, slice_value=0, page_value=0):
-    _feed = makeFeed()
+def list_of_catalogs(slice_value=0, page_value=0):
+    _feed = make_feed()
     if page_value > 0:
-        add_previous_link(_feed, id_value, page_value)
+        add_previous_link(_feed, LIST_CAT, page_value)
     for (item_type, item_id, item_name, item_path, reg_date, item_title) in opdsdb.getitemsincat(slice_value,
                                                                                                  cfg.MAXITEMS,
                                                                                                  page_value):
-        #logging.debug((item_type, item_id, item_name, item_path, reg_date, item_title))
-        _authors = []
         if item_type == 1:
-            _id = '01' + str(item_id)
+            _id = make_href(LIST_CAT, item_id)
+            _entry = pyatom.FeedEntry(title=item_title or item_name,
+                                      id='catalog:{:d}'.format(item_id),
+                                      updated=reg_date)
+            _entry.links.append(AsqusitionLink(_id, rel='subsection').to_dict())
+            _entry.links.append(Link(_id, rel='alternate').to_dict())
+            _feed.add(_entry)
         elif item_type == 2:
-            _id = '07' + str(item_id)
-            _authors = [dict(name=ln + ' ' + fn) for (fn, ln) in opdsdb.getauthors(item_id)]
-        else:
-            _id = '00'
-
-        _entry = pyatom.FeedEntry(title=item_title or item_name,
-                                  id='main:catalogs:' + str(item_id),
-                                  updated=reg_date,
-                                  content_type='text',
-                                  content=', '.join([a['name'] for a in _authors]),
-                                  author=_authors or [])
-        _entry.links.append(AsqusitionLink('/?id=' + _id, rel='subsection').to_dict())
-        _entry.links.append(Link('/?id=' + _id, rel='alternate').to_dict())
-        _feed.entries.append(_entry)
+            book = opdsdb.getbook(item_id)
+            _feed.add(make_book(book))
 
     if opdsdb.next_page:
-        add_next_link(_feed, id_value, page_value)
+        add_next_link(_feed, LIST_CAT, page_value)
     return _feed
 
 
 #########################################################
 # Выбрана сортировка "По авторам" - выбор по несскольким первым буквам автора
 #
-def list_of_authors(id_value, slice_value):
-    i = slice_value
-    letter = ""
-    while i > 0:
-        letter = chr(i % 10000) + letter
-        i //= 10000
-
-    ret = enc_print(
-        '<link type="application/atom+xml;profile=opds-catalog;kind=navigation" rel="start" title="' +
-        cfg.SITE_MAINTITLE + '" href="/?id=00"/>')
+def list_of_authors(slice_value):
+    _feed = make_feed()
+    letter = letter_from_slice(slice_value)
     for (letters, cnt) in opdsdb.getauthor_2letters(letter):
-        _id = ""
-        for i in range(len(letters)):
-            _id += '%04d' % (ord(letters[i]))
-
         if cfg.SPLITTITLES == 0 or cnt <= cfg.SPLITTITLES or len(letters) > 10:
-            _id = '05' + _id
+            _id = make_href(LIST_AUTHOR_CNT, slice_from_letter(letters))
         else:
-            _id = '02' + _id
-
-        ret += enc_print('<entry>')
-        ret += enc_print('<title>-= ' + websym(letters) + ' =-</title>')
-        ret += enc_print('<id>/?id=' + id_value + '</id>')
-        ret += enc_print('<link type="application/atom+xml" rel="alternate" href="/?id=' + _id + '"/>')
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="subsection" href="/?id='
-            + _id + '"/>')
-        ret += enc_print('<content type="text"> Всего: ' + str(cnt) + ' автора(ов).</content>')
-        ret += enc_print('</entry>')
-    return ret
+            _id = make_href(LIST_AUTHORS_CNT, slice_from_letter(letters))
+        _entry = pyatom.FeedEntry(title='-= ' + pyatom.escape(letters) + ' =-',
+                                  id='authors:' + pyatom.escape(letters),
+                                  content_type='text',
+                                  content='Всего: {:d} автора(ов).'.format(cnt))
+        _entry.links.append(Link(_id, rel='alternate').to_dict())
+        _entry.links.append(AsqusitionLink(_id, rel='subsection').to_dict())
+        _feed.add(_entry)
+    return _feed
 
 
 #########################################################
 # Выбрана сортировка "По наименованию" - выбор по нескольким первым буквам наименования
 #
-def list_of_title(id_value, slice_value):
-    i = slice_value
-    letter = ""
-    while i > 0:
-        letter = chr(i % 10000) + letter
-        i = i // 10000
-
-    ret = enc_print(
-        '<link type="application/atom+xml;profile=opds-catalog;kind=navigation" rel="start" title="'
-        + cfg.SITE_MAINTITLE + '" href="/?id=00"/>')
+def list_of_title(slice_value):
+    _feed = make_feed()
+    letter = letter_from_slice(slice_value)
     for (letters, cnt) in opdsdb.gettitle_2letters(letter, cfg.DUBLICATES_SHOW):
-        _id = ''
-        for i in range(len(letters)):
-            _id += '%04d' % (ord(letters[i]))
-
         if cfg.SPLITTITLES == 0 or cnt <= cfg.SPLITTITLES or len(letters) > 10:
-            _id = '10' + _id
+            _id = make_href(LIST_TITLE_SEARCH, slice_from_letter(letters))
         else:
-            _id = '03' + _id
+            _id = make_href(LIST_TITLE_CNT, slice_from_letter(letters))
+        _entry = pyatom.FeedEntry(title='-= ' + pyatom.escape(letters) + ' =-',
+                                  id='title:' + pyatom.escape(letters),
+                                  content_type='text',
+                                  content=' Всего: {:d} наименований.'.format(cnt))
+        _entry.links.append(Link(_id, rel='alternate').to_dict())
+        _entry.links.append(AsqusitionLink(_id, rel='subsection').to_dict())
+        _feed.add(_entry)
 
-        ret += enc_print('<entry>')
-        ret += enc_print('<title>-= ' + websym(letters) + ' =-</title>')
-        ret += enc_print('<id>/?id=' + id_value + '</id>')
-        ret += enc_print('<link type="application/atom+xml" rel="alternate" href="/?id=' + _id + '"/>')
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="subsection" href="/?id=' + _id + '"/>')
-        ret += enc_print('<content type="text"> Всего: ' + str(cnt) + ' наименований.</content>')
-        ret += enc_print('</entry>')
-    return ret
+    return _feed
 
 
 #########################################################
 # Выдача списка книг по наименованию или на основании поискового запроса
 #
-def list_of_title_or_search(id_value, slice_value, page_value, searchTerm):
-    if slice_value >= 0:
-        i = slice_value
-        letter = ""
-        while i > 0:
-            letter = chr(i % 10000) + letter
-            i //= 10000
-    else:
-        letter = "%" + searchTerm
-    ret = ''
-    for (book_id, book_name, book_path, reg_date, book_title, cover, cover_type) in \
-            opdsdb.getbooksfortitle(letter, cfg.MAXITEMS, page_value, cfg.DUBLICATES_SHOW):
-        _id = '07' + str(book_id)
-        ret += enc_print('<entry>')
-        ret += enc_print('<title>' + websym(book_title) + '</title>')
-        ret += enc_print('<updated>' + reg_date.strftime("%Y-%m-%dT%H:%M:%SZ") + '</updated>')
-        ret += enc_print('<id>/?id=' + _id + '</id>')
-        ret += covers(cover, cover_type, book_id)
-        ret += enc_print('<link type="application/atom+xml" rel="alternate" href="/?id=' + _id + '"/>')
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="subsection" href="/?id='
-            + _id + '"/>')
-        authors = ""
-        for (first_name, last_name) in opdsdb.getauthors(book_id):
-            ret += enc_print('<author><name>' + last_name + ' ' + first_name + '</name></author>')
-            if len(authors) > 0:
-                authors += ', '
-            authors += last_name + ' ' + first_name
-        ret += enc_print('<content type="text">' + authors + '</content>')
-        ret += enc_print('</entry>')
+def list_of_title_or_search(slice_value, page_value, search_term):
+    _feed = make_feed()
     if page_value > 0:
-        prev_href = "/?id=" + id_value + "&amp;page=" + str(page_value - 1)
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="prev" title="Previous Page" href="'
-            + prev_href + '" />')
+        add_previous_link(_feed, LIST_TITLE_SEARCH, page_value)
+    letter = letter_from_slice(slice_value) if slice_value >= 0 else "%" + search_term
+    for book in opdsdb.getbooksfortitle(letter, cfg.MAXITEMS, page_value, cfg.DUBLICATES_SHOW):
+        _feed.add(make_book(book))
     if opdsdb.next_page:
-        next_href = "/?id=" + id_value + "&amp;page=" + str(page_value + 1)
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="next" title="Next Page" href="'
-            + next_href + '" />')
-    return ret
+        add_next_link(_feed, LIST_TITLE_SEARCH, page_value)
+    return _feed
 
 
 #########################################################
 # Выбрана сортировка "По жанрам" - показ секций
 #
-def list_of_genre(id_value):
-    ret = enc_print(
-        '<link type="application/atom+xml;profile=opds-catalog;kind=navigation" rel="start" title="'
-        + cfg.SITE_MAINTITLE + '" href="/?id=00"/>')
+def list_of_genre():
+    _feed = make_feed()
     for (genre_id, genre_section, cnt) in opdsdb.getgenres_sections():
-        _id = '12' + str(genre_id)
-        enc_print('<entry>')
-        enc_print('<title>' + genre_section + '</title>')
-        enc_print('<id>/?id=' + id_value + '</id>')
-        enc_print('<link type="application/atom+xml" rel="alternate" href="/?id=' + _id + '"/>')
-        enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="subsection" href="/?id='
-            + _id + '"/>')
-        enc_print('<content type="text"> Всего: ' + str(cnt) + ' книг.</content>')
-        enc_print('</entry>')
-    return ret
+        _id = make_href(LIST_GENRE_SUB_CNT, genre_id)
+        _entry = pyatom.FeedEntry(title=genre_section,
+                                  id='genre:{:d}'.format(genre_id),
+                                  content_type='text',
+                                  content=' Всего: {:d} книг.'.format(cnt))
+        _entry.links.append(Link(_id, rel='alternate').to_dict())
+        _entry.links.append(AsqusitionLink(_id, rel='subsection').to_dict())
+        _feed.add(_entry)
+    return _feed
 
 
 #########################################################
 # Выбрана сортировка "По жанрам" - показ подсекций
 #
-def list_of_genre_subsections(id_value, slice_value):
-    ret = enc_print(
-        '<link type="application/atom+xml;profile=opds-catalog;kind=navigation" rel="start" title="'
-        + cfg.SITE_MAINTITLE + '" href="/?id=00"/>')
+def list_of_genre_subsections(slice_value):
+    _feed = make_feed()
     for (genre_id, genre_subsection, cnt) in opdsdb.getgenres_subsections(slice_value):
-        _id = '13' + str(genre_id)
-        ret += enc_print('<entry>')
-        ret += enc_print('<title>' + genre_subsection + '</title>')
-        ret += enc_print('<id>/?id=' + id_value + '</id>')
-        ret += enc_print('<link type="application/atom+xml" rel="alternate" href="/?id=' + _id + '"/>')
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="subsection" href="/?id='
-            + _id + '"/>')
-        ret += enc_print('<content type="text"> Всего: ' + str(cnt) + ' книг.</content>')
-        ret += enc_print('</entry>')
-    return ret
+        _id = make_href(LIST_SUBSECTION, genre_id)
+        _entry = pyatom.FeedEntry(title=genre_subsection,
+                                  id='genre:{:d}'.format(genre_id),
+                                  content_type='text',
+                                  content=' Всего: {:d} книг.'.format(cnt))
+        _entry.links.append(Link(_id, rel='alternate').to_dict())
+        _entry.links.append(AsqusitionLink(_id, rel='subsection').to_dict())
+        _feed.add(_entry)
+    return _feed
 
 
 #########################################################
 # Выдача списка книг по жанру
 #
-def list_of_subsection(id_value, slice_value, page_value):
-    ret = ''
-    for (book_id, book_name, book_path, reg_date, book_title, cover, cover_type) in \
-            opdsdb.getbooksforgenre(slice_value, cfg.MAXITEMS, page_value, cfg.DUBLICATES_SHOW):
-        _id = '07' + str(book_id)
-        ret += enc_print('<entry>')
-        ret += enc_print('<title>' + websym(book_title) + '</title>')
-        ret += enc_print('<updated>' + reg_date.strftime("%Y-%m-%dT%H:%M:%SZ") + '</updated>')
-        ret += enc_print('<id>/?id=' + _id + '</id>')
-        ret += covers(cover, cover_type, book_id)
-        ret += enc_print('<link type="application/atom+xml" rel="alternate" href="/?id=' + _id + '"/>')
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="subsection" href="/?id='
-            + _id + '"/>')
-        authors = ""
-        for (first_name, last_name) in opdsdb.getauthors(book_id):
-            ret += enc_print('<author><name>' + last_name + ' ' + first_name + '</name></author>')
-            if len(authors) > 0:
-                authors += ', '
-            authors += last_name + ' ' + first_name
-        ret += enc_print('<content type="text">' + authors + '</content>')
-        ret += enc_print('</entry>')
+def list_of_subsection(slice_value, page_value):
+    _feed = make_feed()
     if page_value > 0:
-        prev_href = "/?id=" + id_value + "&amp;page=" + str(page_value - 1)
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="prev" title="Previous Page" href="'
-            + prev_href + '" />')
+        add_previous_link(_feed, LIST_SUBSECTION, page_value)
+    for book in opdsdb.getbooksforgenre(slice_value, cfg.MAXITEMS, page_value, cfg.DUBLICATES_SHOW):
+        _feed.add(make_book(book))
     if opdsdb.next_page:
-        next_href = "/?id=" + id_value + "&amp;page=" + str(page_value + 1)
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="next" title="Next Page" href="'
-            + next_href + '" />')
-    return ret
+        add_next_link(_feed, LIST_SUBSECTION, page_value)
+    return _feed
 
 
 #########################################################
 # Выбрана сортировка "Последние поступления"
 #
 def list_of_last():
-    ret = ''
-    for (book_id, book_name, book_path, reg_date, book_title) in opdsdb.getlastbooks(cfg.MAXITEMS):
-        _id = '07' + str(book_id)
-        ret += enc_print('<entry>')
-        ret += enc_print('<title>' + websym(book_title) + '</title>')
-        ret += enc_print('<updated>' + reg_date.strftime("%Y-%m-%dT%H:%M:%SZ") + '</updated>')
-        ret += enc_print('<id>/?id=04</id>')
-        ret += enc_print('<link type="application/atom+xml" rel="alternate" href="/?id=' + _id + '"/>')
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="subsection" href="/?id='
-            + _id + '"/>')
-        authors = ""
-        for (first_name, last_name) in opdsdb.getauthors(book_id):
-            ret += enc_print('<author><name>' + last_name + ' ' + first_name + '</name></author>')
-            if len(authors) > 0:
-                authors += ', '
-            authors += last_name + ' ' + first_name
-        ret += enc_print('<content type="text">' + authors + '</content>')
-        ret += enc_print('</entry>')
-    return ret
+    _feed = make_feed()
+    for book in opdsdb.getlastbooks(cfg.MAXITEMS):
+        _feed.add(make_book(book))
+    return _feed
 
 
 #########################################################
 # Выдача списка авторов
 #
-def list_authors(id_value, slice_value, page_value):
-    i = slice_value
-    letter = ""
-    while i > 0:
-        letter = chr(i % 10000) + letter
-        i = i // 10000
-
-    ret = enc_print(
-        '<link type="application/atom+xml;profile=opds-catalog;kind=navigation" rel="start" title="'
-        + cfg.SITE_MAINTITLE + '" href="/?id=00"/>')
+def list_authors(slice_value, page_value):
+    _feed = make_feed()
+    if page_value > 0:
+        add_previous_link(_feed, LIST_AUTHOR_CNT, page_value)
+    letter = letter_from_slice(slice_value)
     for (author_id, first_name, last_name, cnt) in opdsdb.getauthorsbyl(letter, cfg.MAXITEMS, page_value,
                                                                         cfg.DUBLICATES_SHOW):
-        _id = '06' + str(author_id)
-        ret += enc_print('<entry>')
-        ret += enc_print('<title>' + last_name + ' ' + first_name + '</title>')
-        ret += enc_print('<id>/?id=' + id_value + '</id>')
-        ret += enc_print('<link type="application/atom+xml" rel="alternate" href="/?id=' + _id + '"/>')
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="subsection" href="/?id='
-            + _id + '"/>')
-        ret += enc_print('<content type="text"> Всего: ' + str(cnt) + ' книг.</content>')
-        ret += enc_print('</entry>')
-    if page_value > 0:
-        prev_href = "/?id=" + id_value + "&amp;page=" + str(page_value - 1)
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="prev" title="Previous Page" href="'
-            + prev_href + '" />')
+        _id = make_href(LIST_BOOK, author_id)
+        _entry = pyatom.FeedEntry(title='{:s} {:s}'.format(last_name, first_name),
+                                  id='author:{:d}'.format(author_id),
+                                  content_type='text',
+                                  content=' Всего: {:d} книг.'.format(cnt))
+        _entry.links.append(Link(_id, rel='alternate').to_dict())
+        _entry.links.append(AsqusitionLink(_id, rel='subsection').to_dict())
+        _feed.add(_entry)
     if opdsdb.next_page:
-        next_href = "/?id=" + id_value + "&amp;page=" + str(page_value + 1)
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="next" title="Next Page" href="'
-            + next_href + '" />')
-    return ret
+        add_next_link(_feed, LIST_AUTHOR_CNT, page_value)
+    return _feed
 
 
 #########################################################
 # Выдача списка книг по автору
 #
-def list_book_of_author(id_value, slice_value, page_value):
-    ret = ''
-    for (book_id, book_name, book_path, reg_date, book_title, cover, cover_type) in \
-            opdsdb.getbooksforautor(slice_value, cfg.MAXITEMS, page_value, cfg.DUBLICATES_SHOW):
-        _id = '07' + str(book_id)
-        ret += enc_print('<entry>')
-        ret += enc_print('<title>' + websym(book_title) + '</title>')
-        ret += enc_print('<updated>' + reg_date.strftime("%Y-%m-%dT%H:%M:%SZ") + '</updated>')
-        ret += enc_print('<id>/?id=' + _id + '</id>')
-        ret += covers(cover, cover_type, book_id)
-        ret += enc_print('<link type="application/atom+xml" rel="alternate" href="/?id=' + _id + '"/>')
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="subsection" href="/?id='
-            + _id + '"/>')
-        authors = ""
-        for (first_name, last_name) in opdsdb.getauthors(book_id):
-            ret += enc_print('<author><name>' + last_name + ' ' + first_name + '</name></author>')
-            if len(authors) > 0:
-                authors += ', '
-            authors += last_name + ' ' + first_name
-        ret += enc_print('<content type="text">' + authors + '</content>')
-        ret += enc_print('</entry>')
+def list_book_of_author(slice_value, page_value):
+    _feed = make_feed()
     if page_value > 0:
-        prev_href = "/?id=" + id_value + "&amp;page=" + str(page_value - 1)
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="prev" title="Previous Page" href="'
-            + prev_href + '" />')
+        add_previous_link(_feed, LIST_BOOK, page_value)
+    for book in opdsdb.getbooksforauthor(slice_value, cfg.MAXITEMS, page_value, cfg.DUBLICATES_SHOW):
+        _feed.add(make_book(book))
     if opdsdb.next_page:
-        next_href = "/?id=" + id_value + "&amp;page=" + str(page_value + 1)
-        ret += enc_print(
-            '<link type="application/atom+xml;profile=opds-catalog;kind=acquisition" rel="next" title="Next Page" href="'
-            + next_href + '" />')
-    return ret
+        add_next_link(_feed, LIST_BOOK, page_value)
+    return _feed
 
 
 #########################################################
 # Выдача ссылок на книгу
 #
-def list_of_ref(id_value, book_id):
-    _feed = makeFeed()
-    _feed.links.append(AsqusitionLink('/?id=07' + str(book_id), rel='self').to_dict())
-    #    (book_name, book_path, reg_date, _format, title, cat_type, cover, cover_type, file_size) = opdsdb.getbook(
-    #        slice_value)
-    book = opdsdb._getbook(book_id)
+def list_of_ref(book_id):
+    _feed = make_feed()
+    _feed.links.append(AsqusitionLink(make_href(BOOK, book_id), rel='self').to_dict())
+    book = opdsdb.getbook(book_id)
     if book:
-        authors = [dict(name=author.last_name + ' ' + author.first_name) for author in book.authors]
-        _content = 'Название книги: {0:s}\nАвтор(ы): {1:s}\nЖанры: {2:s}\nРазмер файла : {3:d} Кб'. \
-            format(book.title, ', '.join([author['name'] for author in authors]),
-                   ', '.join([genre.subsection for genre in book.genres]), book.filesize // 1000)
-        _entry = pyatom.FeedEntry(title='Файл: ' + book.filename,
-                                  id='main:book:' + str(book_id),
-                                  updated=book.registerdate,
-                                  author=authors or [],
-                                  content_type='text',
-                                  content=_content)
-        _entry.links.append(
-            Link('/?id=08' + str(book_id), _type='application/' + book.format, rel='alternate').to_dict())
-        _entry.links.append(Link('/?id=08' + str(book_id), _type='application/' + book.format,
-                                 rel='http://opds-spec.org/acquisition').to_dict())
-        _entry.links.append(Link('/?id=09' + str(book_id), _type='application/' + book.format + '+zip',
-                                 rel='http://opds-spec.org/acquisition').to_dict())
-        _feed.add(_entry)
+        _feed.add(make_book(book))
 
-        #    ret += covers(cover, cover_type, slice_value)
-
-        # genres = ""
-        # for (section, genre) in opdsdb.getgenres(slice_value):
+    # genres = ""
+    # for (section, genre) in opdsdb.getgenres(slice_value):
     #        ret += enc_print('<category term="%s" label="%s" />' % (genre, genre))
     #         if len(genres) > 0:
     #             genres += ', '
@@ -556,120 +416,116 @@ def list_of_ref(id_value, book_id):
 # Выдача файла книги
 #
 def out_file_of_book(book_id):
-    book = opdsdb._getbook(book_id)
+    book = opdsdb.getbook(book_id)
     full_path = os.path.join(cfg.ROOT_LIB, book.path)
     # HTTP Header
+    status = '200 OK'
     headers = [('Content-Type', 'application/octet-stream; name="' + book.filename + '"'),
                ('Content-Disposition', 'attachment; filename=' + translit(book.filename)),
                ('Content-Transfer-Encoding', 'binary')]
-    if book.cat_type == sopdsdb.CAT_NORMAL:
+    buf = ''
+    if book.cat_normal():
         file_path = os.path.join(full_path, book.filename)
-        book_size = os.path.getsize(file_path.encode('utf-8'))
-        headers.append(('Content-Length', str(book_size)))
-        fo = open(file_path, "rb")
-        ret = fo.read()
-        fo.close()
-    elif book.cat_type == sopdsdb.CAT_ZIP:
-        z = zipfile.ZipFile(full_path, 'r', allowZip64=True)
-        book_size = z.getinfo(book.filename).file_size
-        headers.append(('Content-Length', str(book_size)))
-        fo = z.open(book.filename)
-        ret = fo.read()
-        fo.close()
-        z.close()
-    return headers, ret
+        if os.path.exists(file_path):
+            book_size = os.path.getsize(file_path.encode('utf-8'))
+            headers.append(('Content-Length', str(book_size)))
+            fo = open(file_path, "rb")
+            buf = fo.read()
+            fo.close()
+        else:
+            status = '404 Not Found'
+    elif book.cat_zip():
+        if os.path.exists(full_path):
+            z = zipfile.ZipFile(full_path, 'r', allowZip64=True)
+            book_size = z.getinfo(book.filename).file_size
+            headers.append(('Content-Length', str(book_size)))
+            fo = z.open(book.filename)
+            buf = fo.read()
+            fo.close()
+            z.close()
+        else:
+            status = '404 Not Found'
+    return status, headers, buf
 
 
 #########################################################
 # Выдача файла книги в ZIP формате
 #
-def out_zipfile_of_book():
-    return ''
-    # (book_name, book_path, reg_date, format, title, cat_type, cover, cover_type, fsize) = opdsdb.getbook(slice_value)
-    # full_path = os.path.join(cfg.ROOT_LIB, book_path)
-    # transname = translit(book_name)
-    # # HTTP Header
-    # enc_print('Content-Type:application/zip; name="' + book_name + '"')
-    # enc_print("Content-Disposition: attachment; filename=" + transname + '.zip')
-    # enc_print('Content-Transfer-Encoding: binary')
-    # if cat_type == sopdsdb.CAT_NORMAL:
-    #     file_path = os.path.join(full_path, book_name)
-    #     dio = io.BytesIO()
-    #     z = zipf.ZipFile(dio, 'w', zipf.ZIP_DEFLATED)
-    #     z.write(file_path.encode('utf-8'), transname)
-    #     z.close()
-    #     buf = dio.getvalue()
-    #     enc_print('Content-Length: %s' % len(buf))
-    #     enc_print()
-    #     sys.stdout.buffer.write(buf)
-    # elif cat_type == sopdsdb.CAT_ZIP:
-    #     fz = codecs.open(full_path.encode("utf-8"), "rb")
-    #     zi = zipf.ZipFile(fz, 'r', allowZip64=True, codepage=cfg.ZIP_CODEPAGE)
-    #     fo = zi.open(book_name)
-    #     str = fo.read()
-    #     fo.close()
-    #     zi.close()
-    #     fz.close()
-    #
-    #     dio = io.BytesIO()
-    #     zo = zipf.ZipFile(dio, 'w', zipf.ZIP_DEFLATED)
-    #     zo.writestr(transname, str)
-    #     zo.close()
-    #
-    #     buf = dio.getvalue()
-    #     enc_print('Content-Length: %s' % len(buf))
-    #     enc_print()
-    #     sys.stdout.buffer.write(buf)
-    #
-    # opdsdb.closeDB()
+def out_zipfile_of_book(book_id):
+    book = opdsdb.getbook(book_id)
+    full_path = os.path.join(cfg.ROOT_LIB, book.path)
+    trans_name = translit(book.filename)
+    # HTTP Header
+    status = '200 OK'
+    headers = [('Content-Type', 'application/zip; name="{0:s}"'.format(book.filename)),
+               ('Content-Disposition', 'attachment; filename={0:s}.zip'.format(trans_name)),
+               ('Content-Transfer-Encoding', 'binary')]
+    buf = ''
+    dio = io.BytesIO()
+    zo = zipfile.ZipFile(dio, 'w', zipfile.ZIP_DEFLATED)
+    if book.cat_type == sopdsdb.CAT_NORMAL:
+        file_path = os.path.join(full_path, book.filename)
+        if os.path.exists(file_path):
+            zo.write(file_path.encode('utf-8'), trans_name)
+            zo.close()
+            buf = dio.getvalue()
+            headers.append(('Content-Length', str(len(buf))))
+        else:
+            status = '404 Not Found'
+    elif book.cat_type == sopdsdb.CAT_ZIP:
+        if os.path.exists(full_path):
+            z = zipfile.ZipFile(full_path, 'r', allowZip64=True)
+            fo = z.open(book.filename)
+            buf = fo.read()
+            fo.close()
+            z.close()
+            zo.writestr(trans_name, buf)
+            zo.close()
+            buf = dio.getvalue()
+            headers.append(('Content-Length', str(len(buf))))
+        else:
+            status = '404 Not Found'
+    return status, headers, buf
 
 
 #########################################################
 # Выдача Обложки На лету
 #
-def get_cover():
-    return ''
-    # (book_name, book_path, reg_date, format, title, cat_type, cover, cover_type, fsize) = opdsdb.getbook(slice_value)
-    # c0 = 0
-    # if format == 'fb2':
-    #     full_path = os.path.join(cfg.ROOT_LIB, book_path)
-    #     fb2 = sopdsparse.fb2parser(1)
-    #     if cat_type == sopdsdb.CAT_NORMAL:
-    #         file_path = os.path.join(full_path, book_name)
-    #         fo = codecs.open(file_path.encode("utf-8"), "rb")
-    #         fb2.parse(fo, 0)
-    #         fo.close()
-    #     elif cat_type == sopdsdb.CAT_ZIP:
-    #         fz = codecs.open(full_path.encode("utf-8"), "rb")
-    #         z = zipf.ZipFile(fz, 'r', allowZip64=True, codepage=cfg.ZIP_CODEPAGE)
-    #         fo = z.open(book_name)
-    #         fb2.parse(fo, 0)
-    #         fo.close()
-    #         z.close()
-    #         fz.close()
-    #
-    #     if len(fb2.cover_image.cover_data) > 0:
-    #         try:
-    #             s = fb2.cover_image.cover_data
-    #             dstr = base64.b64decode(s)
-    #             ictype = fb2.cover_image.getattr('content-type')
-    #             enc_print('Content-Type:' + ictype)
-    #             enc_print()
-    #             sys.stdout.buffer.write(dstr)
-    #             c0 = 1
-    #         except:
-    #             c0 = 0
-    #
-    # if c0 == 0:
-    #     if os.path.exists(sopdscfg.NOCOVER_IMG):
-    #         enc_print('Content-Type: image/jpeg')
-    #         enc_print()
-    #         f = open(sopdscfg.NOCOVER_IMG, "rb")
-    #         sys.stdout.buffer.write(f.read())
-    #         f.close()
-    #     else:
-    #         print('Status: 404 Not Found')
-    #         print()
+def get_cover(book_id):
+    book = opdsdb.getbook(book_id)
+    no_cover = True
+    status = '200 OK'
+    headers = []
+    buf = ''
+    if book.format == 'fb2':
+        full_path = os.path.join(cfg.ROOT_LIB, book.path)
+        if book.cat_normal():
+            file_path = os.path.join(full_path, book.filename)
+            fb2 = fb2parser.fb2parse(file_path)
+        else:
+            z = zipfile.ZipFile(full_path)
+            f = z.open(book.filename)
+            fb2 = fb2parser.fb2parse(f)
+        if len(fb2['cover_image'] > 0):
+            try:
+                s = fb2['cover_image']
+                buf = base64.b64decode(s)
+                ictype = fb2['cover_image']
+                headers = [('Content-Type', ictype)]
+                no_cover = False
+            except:
+                no_cover = True
+
+    if no_cover:
+        if os.path.exists(cfg.NOCOVER_IMG):
+            headers = [('Content-Type', 'image/jpeg')]
+            f = open(cfg.NOCOVER_IMG, "rb")
+            buf = f.read()
+            f.close()
+        else:
+            status = '404 Not Found'
+
+    return status, headers, buf
 
 
 import pyatom
@@ -683,6 +539,7 @@ def simple_app(environ, start_response):
     type_value = 0
     slice_value = 0
     page_value = 0
+    search_term = ''
 
     if 'id' in d:
         id_value = d.get('id', ['0'])[0]
@@ -696,90 +553,67 @@ def simple_app(environ, start_response):
         if page.isdigit():
             page_value = int(page)
     if 'search' in d:
-        searchTerm = d.get('search', [''])[0]
+        search_term = d.get('search', [''])[0]
         type_value = 10
         slice_value = -1
-        id_value = "10&amp;search=" + searchTerm
+        id_value = "10&amp;search=" + search_term
 
-    status = '200 OK'g
+    status = '200 OK'
     headers = [('Content-type', 'text/xml; charset=utf-8')]
 
     if type_value == 0:
         feed = main_menu()
-        logging.debug(feed)
-        ret = [feed.to_bytestring()]
-    elif type_value == 1:
-        feed = list_of_catalogs(id_value, slice_value, page_value)
-        logging.debug(feed)
-        ret = [feed.to_bytestring()]
-    elif type_value == 2:
-        ret = [header().encode('utf-8'),
-               list_of_authors(id_value, slice_value).encode('utf-8'),
-               footer().encode('utf-8')]
-    elif type_value == 3:
-        ret = [header().encode('utf-8'),
-               list_of_title(id_value, slice_value).encode('utf-8'),
-               footer().encode('utf-8')]
-    elif type_value == 10:
-        ret = [header().encode('utf-8'),
-               list_of_title_or_search(id_value, slice_value, page_value, searchTerm).encode('utf-8'),
-               footer().encode('utf-8')]
-    elif type_value == 11:
-        ret = [header().encode('utf-8'),
-               list_of_genre(id_value).encode('utf-8'),
-               footer().encode('utf-8')]
-    elif type_value == 12:
-        ret = [header().encode('utf-8'),
-               list_of_genre_subsections(id_value, slice_value).encode('utf-8'),
-               footer().encode('utf-8')]
-    elif type_value == 13:
-        ret = [header().encode('utf-8'),
-               list_of_subsection(id_value, slice_value, page_value).encode('utf-8'),
-               footer().encode('utf-8')]
-    elif type_value == 4:
-        ret = [header().encode('utf-8'),
-               list_of_last().encode('utf-8'),
-               footer().encode('utf-8')]
-    elif type_value == 5:
-        ret = [header().encode('utf-8'),
-               list_authors(id_value, slice_value, page_value).encode('utf-8'),
-               footer().encode('utf-8')]
-    elif type_value == 6:
-        ret = [header().encode('utf-8'),
-               list_book_of_author(id_value, slice_value, page_value).encode('utf-8'),
-               footer().encode('utf-8')]
-    elif type_value == 7:
-        feed = list_of_ref(id_value, slice_value)
-        logging.debug(feed)
-        ret = [feed.to_bytestring()]
-    elif type_value == 8:
-        headers, ret = out_file_of_book(slice_value)
-        ret = [ret]
-    elif type_value == 9:
-        ret = [header().encode('utf-8'),
-               out_zipfile_of_book().encode('utf-8'),
-               footer().encode('utf-8')]
-    elif type_value == 99:
-        ret = [header().encode('utf-8'),
-               get_cover().encode('utf-8'),
-               footer().encode('utf-8')]
+    elif type_value == LIST_CAT:
+        feed = list_of_catalogs(slice_value, page_value)
+    elif type_value == LIST_AUTHOR_CNT:
+        feed = list_of_authors(slice_value)
+    elif type_value == LIST_TITLE_CNT:
+        feed = list_of_title(slice_value)
+    elif type_value == LIST_TITLE_SEARCH:
+        feed = list_of_title_or_search(slice_value, page_value, search_term)
+    elif type_value == LIST_GENRE_CNT:
+        feed = list_of_genre()
+    elif type_value == LIST_GENRE_SUB_CNT:
+        feed = list_of_genre_subsections(slice_value)
+    elif type_value == LIST_SUBSECTION:
+        feed = list_of_subsection(slice_value, page_value)
+    elif type_value == LIST_LAST:
+        feed = list_of_last()
+    elif type_value == LIST_AUTHOR_CNT:
+        feed = list_authors(slice_value, page_value)
+    elif type_value == LIST_BOOK:
+        feed = list_book_of_author(slice_value, page_value)
+    elif type_value == BOOK:
+        feed = list_of_ref(slice_value)
+    elif type_value == OUT_BOOK:
+        status, headers, ret = out_file_of_book(slice_value)
+        start_response(status, headers)
+        return [ret]
+    elif type_value == OUT_ZIP_BOOK:
+        status, headers, ret = out_zipfile_of_book(slice_value)
+        start_response(status, headers)
+        return [ret]
+    elif type_value == OUT_COVER:
+        status, headers, ret = get_cover(slice_value)
+        start_response(status, headers)
+        return [ret]
     else:
-        ret = [header().encode('utf-8'),
-               footer().encode('utf-8')]
+        feed = make_feed()
 
     start_response(status, headers)
-    return ret
+    logging.debug(feed)
+    return [feed.to_bytestring()]
 
 
 if __name__ == '__main__':
     logging.basicConfig(filename='server.log', level=logging.DEBUG)
 
     opdsdb = sopdsdb.opdsDatabase(cfg.ENGINE + cfg.DB_NAME, cfg.DB_USER, cfg.DB_PASS, cfg.DB_HOST, cfg.ROOT_LIB)
-    opdsdb.openDB()
+    opdsdb.open_db()
 
     validator_app = validator(simple_app)
     httpd = make_server('', cfg.PORT, validator_app)
     print('Serving on port {0:d}...'.format(cfg.PORT))
     httpd.serve_forever()
 
-    opdsdb.closeDB()
+    opdsdb.close_db()
