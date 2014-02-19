@@ -2,6 +2,7 @@ __author__ = 'vseklecov'
 
 import base64
 import configparser
+import datetime
 import inspect
 import mimetypes
 import os
@@ -39,6 +40,7 @@ class CfgReader:
         self.ZIPSCAN = config.getboolean(CFG_G, 'zipscan', fallback=True)
         self.ZIPRESCAN = config.getboolean(CFG_G, 'ziprescan', fallback=False)
         self.COVER_EXTRACT = config.getboolean(CFG_G, 'cover_extract', fallback=False)
+        self.LAST_SCAN = config.get(CFG_G, 'last_scan', fallback=datetime.date.today())
 
         self.FB2HSIZE = config.getint(CFG_G, 'fb2hsize', fallback=0)
         self.MAXITEMS = config.getint(CFG_G, 'maxitems', fallback=50)
@@ -230,13 +232,18 @@ if __name__ == '__main__':
     if args.verbose:
         print(ext_set)
 
-    for full_path, dirs, files in os.walk(cfg.ROOT_LIB):
-        for name in files:
-            fn = os.path.join(full_path, name)
-            (n, ext) = os.path.splitext(name)
-            if ext.lower() == '.zip' and cfg.ZIPSCAN:
-                processzip(dbase, name, full_path, fn)
-            elif ext.lower() in ext_set:
-                processfile(dbase, name, full_path, fn, cfg)
+    if args.scan_all:
+        for full_path, dirs, files in os.walk(cfg.ROOT_LIB):
+            for name in files:
+                fn = os.path.join(full_path, name)
+                (n, ext) = os.path.splitext(name)
+                if ext.lower() == '.zip' and cfg.ZIPSCAN:
+                    if args.verbose:
+                        print('Add file: {:s}'.format(full_path))
+                    processzip(dbase, name, full_path, fn)
+                elif ext.lower() in ext_set:
+                    if args.verbose:
+                        print('Add file: {:s}'.format(full_path))
+                    processfile(dbase, name, full_path, fn, cfg)
 
     dbase.close_db()
