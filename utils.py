@@ -157,33 +157,6 @@ class FictionBook:
                 self.name_sequence = ''
 
 
-def fb2parse(filename):
-    book = opdsdb.Book()
-    if isinstance(filename, str):
-        tree = ET.parse(filename)
-    else:
-        tree = ET.fromstring(filename.read())
-    root = tree.getroot()
-    ns = root.tag.split('}')[0][1:]
-
-    description = root.find(ET.QName(ns, 'description').text)
-    title_info = description.find(ET.QName(ns, 'title-info').text)
-    for genre in title_info.iter(ET.QName(ns, 'genre').text):
-        book.genres.append(opdsdb.addgenre(genre.text))
-
-    for author in title_info.iter(ET.QName(ns, 'author').text):
-        last_name = author.findtext(ET.QName(ns, 'last-name').text, '')
-        first_name = author.findtext(ET.QName(ns, 'first-name').text, '')
-        book.authors.append(opdsdb.addauthor(first_name, last_name))
-
-    book.lang = title_info.findtext(ET.QName(ns, 'lang').text, 'ru')
-    book.title = title_info.findtext(ET.QName(ns, 'book-title').text, '')
-    #ret['cover_name'] = ''
-    #ret['cover_image'] = ''
-
-    return book
-
-
 def processzip(db, path, zip_filename, cfg):
     rel_path = os.path.relpath(path, cfg.ROOT_LIB)
     rel_file = os.path.join(rel_path, zip_filename)
@@ -248,7 +221,6 @@ def processfile(db, path, filename, cfg, archive=None):
 
 if __name__ == '__main__':
     import argparse
-    import sys
 
     parser = argparse.ArgumentParser(
         description='Simple OPDS Scaner - program for scan your e-book directory and store data to database.')
