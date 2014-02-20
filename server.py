@@ -3,18 +3,17 @@ from fb2parser import fb2parse
 
 __author__ = 'vseklecov'
 
-import base64
 import io
 import logging
+import mimetypes
 import os
 from urllib.parse import parse_qs
 from wsgiref.validate import validator
 from wsgiref.simple_server import make_server
 import zipfile
 
-import fb2parser
 import db as sopdsdb
-from utils import CfgReader
+from utils import CfgReader, FictionBook
 
 cfg = CfgReader()
 
@@ -106,7 +105,10 @@ def make_entry_book(book):
 def make_href(id_value, slice_value=None, page_value=None):
     ret = '/?id={:02d}'.format(id_value)
     if slice_value:
-        ret += '{:d}'.format(slice_value)
+        if isinstance(slice_value, str):
+            ret += '{:s}'.format(slice_value)
+        else:
+            ret += '{:d}'.format(slice_value)
     if page_value:
         ret += '&amp;page={:d}'.format(page_value)
     return ret
@@ -198,17 +200,18 @@ def covers(cover, cover_type, book_id):
         if cfg.COVER_SHOW != 2:
             if cover and cover != '':
                 _id = '../covers/{0:s}'.format(cover)
+                _id_t = '../covers/thumbnails/{0:s}'.format(cover)
                 links.append(Link(_id, rel='http://opds-spec.org/image', _type=cover_type).to_dict())
                 links.append(Link(_id, rel='x-stanza-cover-image', _type=cover_type).to_dict())
-                links.append(Link(_id, rel='http://opds-spec.org/thumbnail', _type=cover_type).to_dict())
-                links.append(Link(_id, rel='x-stanza-cover-image-thumbnail', _type=cover_type).to_dict())
+                links.append(Link(_id_t, rel='http://opds-spec.org/image/thumbnail', _type=cover_type).to_dict())
+                links.append(Link(_id_t, rel='x-stanza-cover-image-thumbnail', _type=cover_type).to_dict())
                 have_extracted_cover = 1
         if cfg.COVER_SHOW == 2 or (cfg.COVER_SHOW == 3 and have_extracted_cover == 0):
             _id = make_href(OUT_COVER, book_id)
             links.append(dict(href=_id, rel='http://opds-spec.org/image'))
-            links.append(dict(href=_id, rel='x-stanza-cover-image'))
-            links.append(dict(href=_id, rel='http://opds-spec.org/thumbnail'))
-            links.append(dict(href=_id, rel='x-stanza-cover-image-thumbnail'))
+            #links.append(dict(href=_id, rel='x-stanza-cover-image'))
+            links.append(dict(href=_id, rel='http://opds-spec.org/image/thumbnail'))
+            #links.append(dict(href=_id, rel='x-stanza-cover-image-thumbnail'))
     return links
 
 
@@ -245,6 +248,7 @@ def list_of_catalogs(slice_value=0, page_value=0):
 def list_of_authors(slice_value):
     _feed = make_feed()
     letter = letter_from_slice(slice_value)
+    logging.debug('letter: "{:s}"'.format(letter))
     for (letters, cnt) in opdsdb.getauthor_2letters(letter):
         if cfg.SPLITTITLES == 0 or cnt <= cfg.SPLITTITLES or len(letters) > 10:
             _id = make_href(LIST_AUTHOR_CNT, slice_from_letter(letters))
@@ -496,22 +500,21 @@ def get_cover(book_id):
     no_cover = True
     status = '200 OK'
     headers = []
-    buf = ''
+    buf = b''
     if book.format == 'fb2':
         full_path = os.path.join(cfg.ROOT_LIB, book.path)
         if book.cat_normal():
             file_path = os.path.join(full_path, book.filename)
-            fb2 = fb2parser.fb2parse(file_path)
+            fb2 = FictionBook(file_path)
         else:
             z = zipfile.ZipFile(full_path)
             f = z.open(book.filename)
-            fb2 = fb2parser.fb2parse(f)
-        if len(fb2['cover_image'] > 0):
+            fb2 = FictionBook(f)
+        if fb2.cover is not None:
             try:
-                s = fb2['cover_image']
-                buf = base64.b64decode(s)
-                ictype = fb2['cover_image']
-                headers = [('Content-Type', ictype)]
+                buf = fb2.cover.image
+                ictype = fb2.cover.content_type
+                headers = [('Content-Type', ictype), ('Content-Length', str(len(buf)))]
                 no_cover = False
             except:
                 no_cover = True
@@ -522,18 +525,54 @@ def get_cover(book_id):
             f = open(cfg.NOCOVER_IMG, "rb")
             buf = f.read()
             f.close()
+            headers.append(('Content-Length', str(len(buf))))
         else:
             status = '404 Not Found'
 
     return status, headers, buf
 
 
+def out_file(path):
+    status = '200 OK'
+    headers = []
+    buf = b''
+    ictype = mimetypes.guess_type(path)[0]
+    if ictype == None:
+        status = '404 Not Found'
+        return status, headers, buf
+
+    headers = [('Content-Type', ictype)]
+    p, filename = os.path.split(path)
+    if p.strip(os.sep+os.altsep) == 'covers':
+        full_path = os.path.join(cfg.COVER_PATH, filename)
+    elif p.strip(os.sep+os.altsep) == 'covers/thumbnails':
+        full_path = os.path.join(cfg.COVER_PATH, 'thumbnails', filename)
+    else:
+        full_path = filename
+    logging.debug('path: %s, full_path: "%s"' % (p, full_path))
+    if os.path.exists(full_path):
+        f = open(full_path, 'rb')
+        buf = f.read()
+        f.close()
+        headers.append(('Content-Length', str(len(buf))))
+    else:
+        status = '404 Not Found'
+    return status, headers, buf
+
 import pyatom
 
 
 def simple_app(environ, start_response):
-    d = parse_qs(environ['QUERY_STRING'])
 
+    path_info = environ['PATH_INFO']
+    logging.debug('path_info: "%s"' % path_info)
+    if path_info != '/':
+        logging.debug(path_info)
+        status, headers, buf = out_file(path_info)
+        start_response(status, headers)
+        return [buf]
+
+    d = parse_qs(environ['QUERY_STRING'])
     logging.debug(d)
 
     type_value = 0
@@ -560,12 +599,12 @@ def simple_app(environ, start_response):
 
     status = '200 OK'
     headers = [('Content-type', 'text/xml; charset=utf-8')]
-
+    logging.debug('type_value: "{:d}"'.format(type_value))
     if type_value == 0:
         feed = main_menu()
     elif type_value == LIST_CAT:
         feed = list_of_catalogs(slice_value, page_value)
-    elif type_value == LIST_AUTHOR_CNT:
+    elif type_value == LIST_AUTHORS_CNT:
         feed = list_of_authors(slice_value)
     elif type_value == LIST_TITLE_CNT:
         feed = list_of_title(slice_value)
